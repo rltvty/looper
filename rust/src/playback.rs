@@ -133,37 +133,60 @@ impl Loop {
     }
 }
 
-/// Manages playback of a loop in sync with the clock.
-pub struct LoopPlayer {
-    /// The loop being played
-    pub loop_data: Option<Loop>,
-    /// Index of the next event to play
+/// An entry in a sequence: a loop with a repeat count.
+#[derive(Debug, Clone)]
+pub struct SequenceEntry {
+    pub loop_data: Loop,
+    /// How many times to play this loop before advancing
+    pub repeat_count: u32,
+}
+
+/// A sequence of loops to play in order.
+#[derive(Debug, Clone)]
+pub struct Sequence {
+    pub entries: Vec<SequenceEntry>,
+}
+
+/// Manages playback of a sequence of loops.
+pub struct SequencePlayer {
+    sequence: Option<Sequence>,
+    /// Index of current entry in sequence
+    current_entry_idx: usize,
+    /// Which iteration of the current loop (0-indexed)
+    current_iteration: u32,
+    /// Index of next event to play in current loop
     next_event_idx: usize,
-    /// Clock position at start of current loop iteration
+    /// Clock position when current loop iteration started
     loop_start_clock: u64,
     /// Whether playback is enabled
     pub playing: bool,
 }
 
-impl LoopPlayer {
+impl SequencePlayer {
     pub fn new() -> Self {
         Self {
-            loop_data: None,
+            sequence: None,
+            current_entry_idx: 0,
+            current_iteration: 0,
             next_event_idx: 0,
             loop_start_clock: 0,
             playing: false,
         }
     }
 
-    /// Load a loop for playback.
-    pub fn load(&mut self, loop_data: Loop) {
-        self.loop_data = Some(loop_data);
+    /// Load a sequence for playback.
+    pub fn load(&mut self, sequence: Sequence) {
+        self.sequence = Some(sequence);
+        self.current_entry_idx = 0;
+        self.current_iteration = 0;
         self.next_event_idx = 0;
         self.loop_start_clock = 0;
     }
 
     /// Start playback from the beginning.
     pub fn start(&mut self) {
+        self.current_entry_idx = 0;
+        self.current_iteration = 0;
         self.next_event_idx = 0;
         self.loop_start_clock = 0;
         self.playing = true;
@@ -174,10 +197,26 @@ impl LoopPlayer {
         self.playing = false;
     }
 
-    /// Reset to loop start (called when transport restarts).
+    /// Reset to sequence start (called when transport restarts).
     pub fn reset(&mut self) {
+        self.current_entry_idx = 0;
+        self.current_iteration = 0;
         self.next_event_idx = 0;
         self.loop_start_clock = 0;
+    }
+
+    /// Get the name of the currently playing loop.
+    pub fn current_loop_name(&self) -> Option<&str> {
+        let sequence = self.sequence.as_ref()?;
+        let entry = sequence.entries.get(self.current_entry_idx)?;
+        Some(&entry.loop_data.name)
+    }
+
+    /// Get current playback state: (entry_index, current_iteration, repeat_count)
+    pub fn current_state(&self) -> Option<(usize, u32, u32)> {
+        let sequence = self.sequence.as_ref()?;
+        let entry = sequence.entries.get(self.current_entry_idx)?;
+        Some((self.current_entry_idx, self.current_iteration + 1, entry.repeat_count))
     }
 
     /// Called on each clock tick. Returns events that should be sent now.
@@ -186,44 +225,73 @@ impl LoopPlayer {
             return Vec::new();
         }
 
-        let loop_data = match &self.loop_data {
-            Some(l) => l,
+        let sequence = match &self.sequence {
+            Some(s) => s,
             None => return Vec::new(),
         };
 
-        if loop_data.events.is_empty() || loop_data.length_clocks == 0 {
+        if sequence.entries.is_empty() {
             return Vec::new();
         }
 
-        // Calculate position within the loop
-        let position_in_loop = (clock_count - self.loop_start_clock) % loop_data.length_clocks;
+        let entry = &sequence.entries[self.current_entry_idx];
+        let repeat_count = entry.repeat_count;
+        let length_clocks = entry.loop_data.length_clocks;
 
-        // Check if we've wrapped around to a new loop iteration
-        let expected_iteration =
-            (clock_count - self.loop_start_clock) / loop_data.length_clocks;
-        if expected_iteration > 0 && position_in_loop == 0 {
-            // We just started a new iteration
+        if entry.loop_data.events.is_empty() || length_clocks == 0 {
+            return Vec::new();
+        }
+
+        // Calculate position within current loop
+        let elapsed = clock_count.saturating_sub(self.loop_start_clock);
+        let position_in_loop = elapsed % length_clocks;
+        let iteration = elapsed / length_clocks;
+
+        // Check if we need to advance to next entry
+        if iteration >= repeat_count as u64 {
+            self.advance_to_next_entry(clock_count);
+            // Return events at position 0 of the new entry
+            return self.collect_events_at_position(0);
+        }
+
+        // Check if we've wrapped to a new iteration within current loop
+        if iteration as u32 > self.current_iteration {
+            self.current_iteration = iteration as u32;
             self.next_event_idx = 0;
         }
 
-        // Collect events that should play at this position
-        let mut events_to_send = Vec::new();
+        // Collect events at current position
+        self.collect_events_at_position(position_in_loop)
+    }
 
-        while self.next_event_idx < loop_data.events.len() {
-            let event = &loop_data.events[self.next_event_idx];
-            if event.clock_position <= position_in_loop {
-                events_to_send.push(event.message.clone());
+    fn advance_to_next_entry(&mut self, clock_count: u64) {
+        let num_entries = self.sequence.as_ref().unwrap().entries.len();
+        self.current_entry_idx = (self.current_entry_idx + 1) % num_entries;
+        self.current_iteration = 0;
+        self.next_event_idx = 0;
+        self.loop_start_clock = clock_count;
+    }
+
+    fn collect_events_at_position(&mut self, position: u64) -> Vec<Vec<u8>> {
+        let events_ref = &self.sequence.as_ref().unwrap().entries[self.current_entry_idx]
+            .loop_data
+            .events;
+
+        let mut events = Vec::new();
+        while self.next_event_idx < events_ref.len() {
+            let event = &events_ref[self.next_event_idx];
+            if event.clock_position <= position {
+                events.push(event.message.clone());
                 self.next_event_idx += 1;
             } else {
                 break;
             }
         }
-
-        events_to_send
+        events
     }
 }
 
-impl Default for LoopPlayer {
+impl Default for SequencePlayer {
     fn default() -> Self {
         Self::new()
     }
@@ -269,25 +337,258 @@ mod tests {
     }
 
     #[test]
-    fn test_player_not_playing_returns_empty() {
-        let mut player = LoopPlayer::new();
-        player.load(make_test_loop());
-        // Don't call start() - playing is false
-        assert!(player.tick(0).is_empty());
-        assert!(player.tick(10).is_empty());
+    fn test_set_channel() {
+        let mut loop_data = make_test_loop();
+        loop_data.set_channel(5);
+
+        // Check all events are on channel 5
+        for event in &loop_data.events {
+            assert_eq!(event.channel, 5);
+            assert_eq!(event.message[0] & 0x0F, 5);
+        }
+    }
+
+    // ============ Sequence Player Tests ============
+
+    fn make_test_loop_named(name: &str, note: u8) -> Loop {
+        Loop {
+            name: name.to_string(),
+            length_clocks: 96, // 1 bar
+            events: vec![
+                LoopEvent {
+                    clock_position: 0,
+                    channel: 0,
+                    message: vec![0x90, note, 100],
+                },
+                LoopEvent {
+                    clock_position: 48,
+                    channel: 0,
+                    message: vec![0x80, note, 0],
+                },
+            ],
+        }
     }
 
     #[test]
-    fn test_player_no_loop_returns_empty() {
-        let mut player = LoopPlayer::new();
+    fn test_sequence_not_playing_returns_empty() {
+        let mut player = SequencePlayer::new();
+        player.load(Sequence {
+            entries: vec![SequenceEntry {
+                loop_data: make_test_loop(),
+                repeat_count: 2,
+            }],
+        });
+        // Don't call start() - playing is false
+        assert!(player.tick(0).is_empty());
+    }
+
+    #[test]
+    fn test_sequence_no_sequence_returns_empty() {
+        let mut player = SequencePlayer::new();
         player.playing = true;
         assert!(player.tick(0).is_empty());
     }
 
     #[test]
-    fn test_player_emits_events_at_correct_time() {
-        let mut player = LoopPlayer::new();
-        player.load(make_test_loop());
+    fn test_sequence_plays_first_entry() {
+        let mut player = SequencePlayer::new();
+        player.load(Sequence {
+            entries: vec![
+                SequenceEntry {
+                    loop_data: make_test_loop_named("loop1", 60),
+                    repeat_count: 2,
+                },
+                SequenceEntry {
+                    loop_data: make_test_loop_named("loop2", 64),
+                    repeat_count: 2,
+                },
+            ],
+        });
+        player.start();
+
+        // Should get first loop's first event (note 60)
+        let events = player.tick(0);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0], vec![0x90, 60, 100]);
+    }
+
+    #[test]
+    fn test_sequence_repeats_before_advancing() {
+        let mut player = SequencePlayer::new();
+        player.load(Sequence {
+            entries: vec![
+                SequenceEntry {
+                    loop_data: make_test_loop_named("loop1", 60),
+                    repeat_count: 2,
+                },
+                SequenceEntry {
+                    loop_data: make_test_loop_named("loop2", 64),
+                    repeat_count: 2,
+                },
+            ],
+        });
+        player.start();
+
+        // First iteration of loop1
+        player.tick(0); // Note on 60
+        player.tick(48); // Note off 60
+
+        // Second iteration of loop1 (at clock 96)
+        let events = player.tick(96);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0], vec![0x90, 60, 100]); // Still loop1's note
+    }
+
+    #[test]
+    fn test_sequence_advances_after_repeat_count() {
+        let mut player = SequencePlayer::new();
+        player.load(Sequence {
+            entries: vec![
+                SequenceEntry {
+                    loop_data: make_test_loop_named("loop1", 60),
+                    repeat_count: 2,
+                },
+                SequenceEntry {
+                    loop_data: make_test_loop_named("loop2", 64),
+                    repeat_count: 2,
+                },
+            ],
+        });
+        player.start();
+
+        // Play through loop1 twice (2 bars = 192 clocks)
+        player.tick(0); // Bar 1 note on
+        player.tick(48); // Bar 1 note off
+        player.tick(96); // Bar 2 note on
+        player.tick(144); // Bar 2 note off
+
+        // At clock 192, should advance to loop2
+        let events = player.tick(192);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0], vec![0x90, 64, 100]); // Loop2's note
+    }
+
+    #[test]
+    fn test_sequence_cycles_back_to_first() {
+        let mut player = SequencePlayer::new();
+        player.load(Sequence {
+            entries: vec![
+                SequenceEntry {
+                    loop_data: make_test_loop_named("loop1", 60),
+                    repeat_count: 1, // Just 1 repeat each
+                },
+                SequenceEntry {
+                    loop_data: make_test_loop_named("loop2", 64),
+                    repeat_count: 1,
+                },
+            ],
+        });
+        player.start();
+
+        // Loop1 (96 clocks)
+        player.tick(0);
+        player.tick(48);
+
+        // Loop2 starts at 96
+        let events = player.tick(96);
+        assert_eq!(events[0], vec![0x90, 64, 100]);
+        player.tick(144);
+
+        // Back to loop1 at 192
+        let events = player.tick(192);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0], vec![0x90, 60, 100]); // Back to loop1
+    }
+
+    #[test]
+    fn test_sequence_reset() {
+        let mut player = SequencePlayer::new();
+        player.load(Sequence {
+            entries: vec![
+                SequenceEntry {
+                    loop_data: make_test_loop_named("loop1", 60),
+                    repeat_count: 1,
+                },
+                SequenceEntry {
+                    loop_data: make_test_loop_named("loop2", 64),
+                    repeat_count: 1,
+                },
+            ],
+        });
+        player.start();
+
+        // Advance to loop2
+        player.tick(0);
+        player.tick(96); // Now on loop2
+
+        // Reset
+        player.reset();
+
+        // Should be back at loop1
+        let events = player.tick(0);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0], vec![0x90, 60, 100]);
+    }
+
+    #[test]
+    fn test_sequence_current_loop_name() {
+        let mut player = SequencePlayer::new();
+        player.load(Sequence {
+            entries: vec![
+                SequenceEntry {
+                    loop_data: make_test_loop_named("First Loop", 60),
+                    repeat_count: 1,
+                },
+                SequenceEntry {
+                    loop_data: make_test_loop_named("Second Loop", 64),
+                    repeat_count: 1,
+                },
+            ],
+        });
+        player.start();
+
+        assert_eq!(player.current_loop_name(), Some("First Loop"));
+
+        // Advance to second loop
+        player.tick(0);
+        player.tick(96);
+
+        assert_eq!(player.current_loop_name(), Some("Second Loop"));
+    }
+
+    #[test]
+    fn test_sequence_current_state() {
+        let mut player = SequencePlayer::new();
+        player.load(Sequence {
+            entries: vec![SequenceEntry {
+                loop_data: make_test_loop_named("test", 60),
+                repeat_count: 3,
+            }],
+        });
+        player.start();
+
+        // First iteration
+        assert_eq!(player.current_state(), Some((0, 1, 3)));
+
+        // Tick through first iteration
+        player.tick(0);
+        player.tick(96); // Now on second iteration
+
+        assert_eq!(player.current_state(), Some((0, 2, 3)));
+
+        player.tick(192); // Third iteration
+        assert_eq!(player.current_state(), Some((0, 3, 3)));
+    }
+
+    #[test]
+    fn test_sequence_emits_events_at_correct_time() {
+        let mut player = SequencePlayer::new();
+        player.load(Sequence {
+            entries: vec![SequenceEntry {
+                loop_data: make_test_loop(), // Has events at 0, 24, 48, 72
+                repeat_count: 1,
+            }],
+        });
         player.start();
 
         // Clock 0: should get first note on
@@ -307,78 +608,33 @@ mod tests {
     }
 
     #[test]
-    fn test_player_loops_correctly() {
-        let mut player = LoopPlayer::new();
-        player.load(make_test_loop());
-        player.start();
-
-        // Play through first iteration
-        player.tick(0); // Note on
-        player.tick(24); // Note off
-        player.tick(48); // Note on
-        player.tick(72); // Note off
-
-        // At clock 96, we should loop back and get the first event again
-        let events = player.tick(96);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0], vec![0x90, 60, 100]); // First note on again
-    }
-
-    #[test]
-    fn test_player_reset() {
-        let mut player = LoopPlayer::new();
-        player.load(make_test_loop());
-        player.start();
-
-        // Advance partway through
-        player.tick(0);
-        player.tick(24);
-        player.tick(48);
-
-        // Reset
-        player.reset();
-
-        // Should get first event again at clock 0
-        let events = player.tick(0);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0], vec![0x90, 60, 100]);
-    }
-
-    #[test]
-    fn test_set_channel() {
-        let mut loop_data = make_test_loop();
-        loop_data.set_channel(5);
-
-        // Check all events are on channel 5
-        for event in &loop_data.events {
-            assert_eq!(event.channel, 5);
-            assert_eq!(event.message[0] & 0x0F, 5);
-        }
-    }
-
-    #[test]
-    fn test_multiple_events_same_clock() {
-        let mut player = LoopPlayer::new();
-        player.load(Loop {
-            name: "test".to_string(),
-            length_clocks: 96,
-            events: vec![
-                LoopEvent {
-                    clock_position: 0,
-                    channel: 0,
-                    message: vec![0x90, 60, 100],
+    fn test_sequence_multiple_events_same_clock() {
+        let mut player = SequencePlayer::new();
+        player.load(Sequence {
+            entries: vec![SequenceEntry {
+                loop_data: Loop {
+                    name: "chord".to_string(),
+                    length_clocks: 96,
+                    events: vec![
+                        LoopEvent {
+                            clock_position: 0,
+                            channel: 0,
+                            message: vec![0x90, 60, 100],
+                        },
+                        LoopEvent {
+                            clock_position: 0,
+                            channel: 0,
+                            message: vec![0x90, 64, 100],
+                        },
+                        LoopEvent {
+                            clock_position: 0,
+                            channel: 0,
+                            message: vec![0x90, 67, 100],
+                        },
+                    ],
                 },
-                LoopEvent {
-                    clock_position: 0,
-                    channel: 0,
-                    message: vec![0x90, 64, 100],
-                },
-                LoopEvent {
-                    clock_position: 0,
-                    channel: 0,
-                    message: vec![0x90, 67, 100],
-                },
-            ],
+                repeat_count: 1,
+            }],
         });
         player.start();
 
@@ -388,12 +644,27 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_loop() {
-        let mut player = LoopPlayer::new();
-        player.load(Loop {
-            name: "empty".to_string(),
-            length_clocks: 96,
-            events: vec![],
+    fn test_sequence_empty_entries() {
+        let mut player = SequencePlayer::new();
+        player.load(Sequence { entries: vec![] });
+        player.start();
+
+        assert!(player.tick(0).is_empty());
+        assert!(player.tick(96).is_empty());
+    }
+
+    #[test]
+    fn test_sequence_with_empty_loop() {
+        let mut player = SequencePlayer::new();
+        player.load(Sequence {
+            entries: vec![SequenceEntry {
+                loop_data: Loop {
+                    name: "empty".to_string(),
+                    length_clocks: 96,
+                    events: vec![],
+                },
+                repeat_count: 2,
+            }],
         });
         player.start();
 

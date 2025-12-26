@@ -15,9 +15,9 @@ A MIDI looper application that syncs to external MIDI clock (e.g., Ableton Live)
 - Loop playback synced to external clock
 - MIDI output to external devices
 - GUI using iced framework
+- Sequence playback (loop chaining with configurable repeat counts)
 
 **Not Yet Implemented (from initial_plan.md):**
-- Loop chaining (A 4x → B 4x → repeat)
 - Cross-fading between loops via velocity
 - Acting as clock master (currently only syncs to external clock)
 - Dynamic loop loading from UI
@@ -67,17 +67,22 @@ MIDI real-time message constants:
 - `Loop`: Loaded MIDI file with events sorted by clock position
   - `from_file()`: Parses MIDI file, converts ticks to 24 ppqn clock resolution
   - `set_channel()`: Override MIDI channel for all events
-- `LoopPlayer`: Manages playback state
-  - `tick()`: Called on each clock pulse, returns events to send
-  - Handles loop wrapping automatically
+- `SequenceEntry`: A loop paired with its repeat count
+- `Sequence`: Ordered list of `SequenceEntry` items
+- `SequencePlayer`: Manages playback of a sequence
+  - `tick()`: Returns events at current position, handles loop repeats and sequence advancement
   - `reset()`: Called on transport START to restart from beginning
+  - `current_loop_name()`: Returns name of currently playing loop
+  - `current_state()`: Returns (entry_index, current_iteration, repeat_count)
+  - Automatically cycles back to first entry after last entry completes
 
 **Playback flow:**
 1. MIDI clock callback receives clock pulse
 2. Updates `ClockState` with new position
-3. Calls `LoopPlayer::tick(clock_count)`
+3. Calls `SequencePlayer::tick(clock_count)`
 4. Returns any events at current position
 5. Sends events via `MidiOut`
+6. When repeat count reached, advances to next sequence entry
 
 ## Dependencies
 
@@ -115,7 +120,7 @@ Atomics don't support f64. Storing as integer × 100 gives 2 decimal precision w
 ### Why playback happens in MIDI callback
 - Tight timing: events sent immediately when clock pulse received
 - No scheduling jitter from GUI thread
-- Uses `Arc<Mutex<LoopPlayer>>` for thread-safe access
+- Uses `Arc<Mutex<SequencePlayer>>` for thread-safe access
 
 ### MIDI tick conversion
 MIDI files use variable PPQ (pulses per quarter note), typically 480 or 960. The looper converts to 24 ppqn (MIDI clock resolution):
@@ -129,9 +134,9 @@ let clock_position = (file_tick * 24) / file_ppq;
 cargo test
 ```
 
-18 tests total:
+24 tests total:
 - **clock.rs** (10 tests): Transport handling, BPM calculation, position tracking
-- **playback.rs** (8 tests): Event timing, loop wrapping, channel override, edge cases
+- **playback.rs** (14 tests): Channel override, sequence playback, event timing, advancement, cycling
 
 ## Running
 
@@ -145,16 +150,18 @@ cargo run
 - External clock source (e.g., Ableton Live sending MIDI clock)
 - MIDI output routed back to DAW to hear the loop
 
-**Current hardcoded loop:**
-`../data/out/Rappers Delight - bass - Electric Bass finger - bars 13-16.mid`
+**Current hardcoded sequence (2x each, then cycles):**
+1. `Billie Jean - bass - Bass finger - bars 15-26.mid` (12 bars)
+2. `Psycho Killer - bass - Bass - Tina Weymouth - bars 107-110.mid` (4 bars)
+3. `Rappers Delight - bass - Electric Bass finger - bars 13-16.mid` (4 bars)
+4. `Seven Nation Army With Bass Guitar - bass - Jack White Bass Immitation - bars 1-4.mid` (4 bars)
 
 ## Next Steps (Suggested Priority)
 
 1. **Loop selection UI** - Browse and load loops from data/out directory
-2. **Loop chaining** - Play A 4x, then B 4x, repeat
-3. **Multiple simultaneous loops** - Layer drums + bass
-4. **Cross-fading** - Velocity-based blend between two loops
-5. **Clock master mode** - Generate clock instead of syncing
+2. **Multiple simultaneous loops** - Layer drums + bass
+3. **Cross-fading** - Velocity-based blend between two loops
+4. **Clock master mode** - Generate clock instead of syncing
 
 ## Platform Notes
 

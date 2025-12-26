@@ -16,7 +16,7 @@ use midir::MidiInput;
 
 use clock::ClockState;
 use midi::MidiOut;
-use playback::{Loop, LoopPlayer};
+use playback::{Loop, Sequence, SequenceEntry, SequencePlayer};
 
 fn main() -> iced::Result {
     iced::application(Looper::new, Looper::update, Looper::view)
@@ -28,12 +28,11 @@ fn main() -> iced::Result {
 
 struct Looper {
     clock_state: ClockState,
-    loop_player: Arc<Mutex<LoopPlayer>>,
+    sequence_player: Arc<Mutex<SequencePlayer>>,
     midi_in_connected: bool,
     midi_out_connected: bool,
     in_port_name: String,
     out_port_name: String,
-    loop_name: String,
     // Keep connections alive
     _midi_in_connection: Option<midir::MidiInputConnection<()>>,
     _midi_out: Arc<Mutex<Option<MidiOut>>>,
@@ -47,31 +46,46 @@ enum Message {
 impl Looper {
     fn new() -> Self {
         let clock_state = ClockState::new();
-        let loop_player = Arc::new(Mutex::new(LoopPlayer::new()));
+        let sequence_player = Arc::new(Mutex::new(SequencePlayer::new()));
         let midi_out = Arc::new(Mutex::new(MidiOut::new().ok()));
 
-        // Load the bass loop
-        let loop_path = "../data/out/Rappers Delight - bass - Electric Bass finger - bars 13-16.mid";
-        let mut loop_name = "No loop loaded".to_string();
+        // Define loops to load: (path, bar_length)
+        let loop_configs = [
+            ("../data/out/Billie Jean - bass - Bass finger - bars 15-26.mid", 12),
+            ("../data/out/Psycho Killer - bass - Bass - Tina Weymouth - bars 107-110.mid", 4),
+            ("../data/out/Rappers Delight - bass - Electric Bass finger - bars 13-16.mid", 4),
+            ("../data/out/Seven Nation Army With Bass Guitar - bass - Jack White Bass Immitation - bars 1-4.mid", 4),
+        ];
+        let repeat_count = 2;
 
-        match Loop::from_file(loop_path, 4) {
-            Ok(mut loaded_loop) => {
-                // Set to MIDI channel 1 (0-indexed = 0)
-                loaded_loop.set_channel(0);
-                loop_name = loaded_loop.name.clone();
-                println!(
-                    "Loaded loop: {} ({} events, {} clocks)",
-                    loop_name,
-                    loaded_loop.events.len(),
-                    loaded_loop.length_clocks
-                );
-                let mut player = loop_player.lock().unwrap();
-                player.load(loaded_loop);
-                player.start();
+        // Load all loops
+        let mut entries = Vec::new();
+        for (path, bars) in &loop_configs {
+            match Loop::from_file(path, *bars) {
+                Ok(mut loaded_loop) => {
+                    loaded_loop.set_channel(0); // MIDI channel 1 (0-indexed)
+                    println!(
+                        "Loaded loop: {} ({} events, {} clocks)",
+                        loaded_loop.name,
+                        loaded_loop.events.len(),
+                        loaded_loop.length_clocks
+                    );
+                    entries.push(SequenceEntry {
+                        loop_data: loaded_loop,
+                        repeat_count,
+                    });
+                }
+                Err(e) => {
+                    eprintln!("Failed to load loop {}: {}", path, e);
+                }
             }
-            Err(e) => {
-                eprintln!("Failed to load loop: {}", e);
-            }
+        }
+
+        if !entries.is_empty() {
+            let sequence = Sequence { entries };
+            let mut player = sequence_player.lock().unwrap();
+            player.load(sequence);
+            player.start();
         }
 
         let out_port_name = midi_out
@@ -85,18 +99,17 @@ impl Looper {
         // Start MIDI listener with playback callback
         let (midi_in_connection, in_port_name) = start_midi_listener(
             clock_state.clone(),
-            loop_player.clone(),
+            sequence_player.clone(),
             midi_out.clone(),
         );
 
         Self {
             clock_state,
-            loop_player,
+            sequence_player,
             midi_in_connected: midi_in_connection.is_some(),
             midi_out_connected,
             in_port_name,
             out_port_name,
-            loop_name,
             _midi_in_connection: midi_in_connection,
             _midi_out: midi_out,
         }
@@ -134,12 +147,26 @@ impl Looper {
             "OUT: ❌ Not connected".to_string()
         };
 
+        // Get current sequence state
+        let (loop_name, loop_progress) = {
+            let player = self.sequence_player.lock().unwrap();
+            let name = player
+                .current_loop_name()
+                .unwrap_or("No sequence loaded")
+                .to_string();
+            let progress = player
+                .current_state()
+                .map(|(_, iter, total)| format!("{}/{}", iter, total))
+                .unwrap_or_default();
+            (name, progress)
+        };
+
         let content = column![
             text("MIDI Looper").size(40),
             text(in_status).size(14),
             text(out_status).size(14),
             text("").size(10),
-            text(format!("Loop: {}", self.loop_name)).size(16),
+            text(format!("Loop: {} ({})", loop_name, loop_progress)).size(16),
             text("").size(10),
             text(status).size(30).color(status_color),
             text("").size(10),
@@ -174,7 +201,7 @@ impl Default for Looper {
 
 fn start_midi_listener(
     clock_state: ClockState,
-    loop_player: Arc<Mutex<LoopPlayer>>,
+    sequence_player: Arc<Mutex<SequencePlayer>>,
     midi_out: Arc<Mutex<Option<MidiOut>>>,
 ) -> (Option<midir::MidiInputConnection<()>>, String) {
     let midi_in = match MidiInput::new("looper-clock") {
@@ -214,7 +241,7 @@ fn start_midi_listener(
 
                 // Get events to play
                 let events = {
-                    let mut player = loop_player.lock().unwrap();
+                    let mut player = sequence_player.lock().unwrap();
                     // Only play when clock is running
                     if clock_state.is_running() {
                         player.tick(clock_count)
@@ -235,9 +262,9 @@ fn start_midi_listener(
                 }
             }
 
-            // Reset loop player on transport start
+            // Reset sequence player on transport start
             if !message.is_empty() && message[0] == midi::MIDI_START {
-                let mut player = loop_player.lock().unwrap();
+                let mut player = sequence_player.lock().unwrap();
                 player.reset();
             }
         },

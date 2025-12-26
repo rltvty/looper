@@ -115,10 +115,6 @@ impl ClockState {
         self.running.load(Ordering::SeqCst)
     }
 
-    pub fn has_seen_transport(&self) -> bool {
-        self.seen_transport.load(Ordering::SeqCst)
-    }
-
     pub fn get_clock_count(&self) -> u64 {
         self.clock_count.load(Ordering::SeqCst)
     }
@@ -211,7 +207,6 @@ mod tests {
     fn test_initial_state() {
         let state = ClockState::new();
         assert!(!state.is_running());
-        assert!(!state.has_seen_transport());
         assert_eq!(state.get_clock_count(), 0);
         assert_eq!(state.get_position(), (1, 1));
         assert_eq!(state.get_bpm(), 0.0);
@@ -222,9 +217,9 @@ mod tests {
         let state = ClockState::new();
         assert!(!state.is_running());
 
+        // Without any transport messages, clock pulses auto-start playback
         state.handle_midi_message(&[MIDI_CLOCK]);
         assert!(state.is_running());
-        assert!(!state.has_seen_transport());
         assert_eq!(state.get_clock_count(), 1);
     }
 
@@ -234,12 +229,11 @@ mod tests {
 
         state.handle_midi_message(&[MIDI_START]);
         assert!(state.is_running());
-        assert!(state.has_seen_transport());
 
         state.handle_midi_message(&[MIDI_STOP]);
         assert!(!state.is_running());
 
-        // Clock pulses should NOT auto-start after we've seen transport
+        // Clock pulses should NOT auto-start after we've seen transport messages
         state.handle_midi_message(&[MIDI_CLOCK]);
         assert!(!state.is_running());
         assert_eq!(state.get_clock_count(), 0);
