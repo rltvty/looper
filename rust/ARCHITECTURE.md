@@ -9,18 +9,19 @@ A MIDI looper application that syncs to external MIDI clock (e.g., Ableton Live)
 **Implemented:**
 - External MIDI clock sync (receives clock from DAW)
 - Transport tracking (START/STOP/CONTINUE messages)
+- Transport control (Play/Stop buttons send MIDI transport messages)
 - Real-time BPM calculation using rolling 1-bar average
 - Bar/beat position display
 - MIDI file loading and parsing via midly
 - Loop playback synced to external clock
 - MIDI output to external devices
-- GUI using iced framework
+- GUI using iced framework with transport control buttons
 - Sequence playback (loop chaining with configurable repeat counts)
 
 **Not Yet Implemented (from initial_plan.md):**
 - Cross-fading between loops via velocity
-- Acting as clock master (currently only syncs to external clock)
 - Dynamic loop loading from UI
+- Configurable BPM in master mode (currently fixed at 120 BPM)
 
 ## Module Structure
 
@@ -36,7 +37,15 @@ src/
 - `Looper` struct: iced application state
 - `start_midi_listener()`: Connects MIDI input, wires up clock + playback callback
 - Loads loop file at startup, sets MIDI channel
-- GUI renders: MIDI I/O status, loop name, play/stop state, BPM, bar/beat position
+- GUI renders: MIDI I/O status, clock mode, loop name, transport controls, BPM, bar/beat position
+- Clock mode toggle (External/Master):
+  - External: Syncs to incoming MIDI clock from DAW
+  - Master: Generates 120 BPM clock, drives external devices
+  - Background thread generates clock pulses in master mode
+- Transport control buttons:
+  - Play: Sends START (or STOP+START if already playing)
+  - Stop: Sends STOP
+  - Button colors: Play=green/grey, Stop=grey/red based on transport state
 - 50ms tick subscription triggers UI refresh
 
 ### clock.rs
@@ -61,6 +70,7 @@ MIDI real-time message constants:
 `MidiOut` struct: Wrapper for midir output connection
 - Auto-selects IAC Driver if available
 - `send()` method for transmitting MIDI messages
+- `send_start()` / `send_stop()` for transport control
 
 ### playback.rs
 - `LoopEvent`: Single MIDI event with clock position, channel, and raw bytes
@@ -128,6 +138,26 @@ MIDI files use variable PPQ (pulses per quarter note), typically 480 or 960. The
 let clock_position = (file_tick * 24) / file_ppq;
 ```
 
+### Clock master mode architecture
+In master mode, a background thread generates clock pulses:
+- Calculates absolute target time for each tick: `target_nanos = clock_count * 60_000_000_000 / (BPM * 24)`
+- Sleeps until target time (avoids cumulative drift from individual sleep jitter)
+- Calls `ClockState::handle_midi_message()` to update internal position
+- Sends MIDI clock + note events to output
+- MIDI input callback ignores incoming clock/transport in master mode
+- `Arc<AtomicBool>` flag for lock-free mode switching
+
+## Debugging Tools
+
+### midi_monitor
+A CLI tool for debugging MIDI messages:
+```bash
+cargo run --bin midi_monitor -- --duration 10
+```
+- Displays all incoming MIDI messages with timestamps, type, hex bytes, and human-readable details
+- Useful for debugging MIDI routing issues
+- `--duration <secs>` sets monitoring duration (optional)
+
 ## Testing
 
 ```bash
@@ -147,7 +177,8 @@ cargo run
 
 **Requirements:**
 - MIDI input device (or virtual port like IAC Driver on macOS)
-- External clock source (e.g., Ableton Live sending MIDI clock)
+- In External mode: clock source (e.g., Ableton Live sending MIDI clock)
+- In Master mode: no external clock needed (looper generates 120 BPM)
 - MIDI output routed back to DAW to hear the loop
 
 **Current hardcoded sequence (2x each, then cycles):**
@@ -158,10 +189,10 @@ cargo run
 
 ## Next Steps (Suggested Priority)
 
-1. **Loop selection UI** - Browse and load loops from data/out directory
-2. **Multiple simultaneous loops** - Layer drums + bass
-3. **Cross-fading** - Velocity-based blend between two loops
-4. **Clock master mode** - Generate clock instead of syncing
+1. **Configurable BPM** - Adjust tempo in master mode (currently fixed at 120)
+2. **Loop selection UI** - Browse and load loops from data/out directory
+3. **Multiple simultaneous loops** - Layer drums + bass
+4. **Cross-fading** - Velocity-based blend between two loops
 
 ## Platform Notes
 

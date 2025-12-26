@@ -3,6 +3,14 @@ name = "looper"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "looper"
+path = "src/main.rs"
+
+[[bin]]
+name = "midi_monitor"
+path = "src/bin/midi_monitor.rs"
+
 [dependencies]
 # MIDI hardware I/O (ports, real-time messages)
 midir = "0.10"

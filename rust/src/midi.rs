@@ -60,6 +60,7 @@ impl MidiOut {
             .connect(port, "looper-out")
             .map_err(|e| format!("Failed to connect MIDI output: {}", e))?;
 
+        println!("MIDI Output connected to: {}", port_name);
         Ok(Self {
             connection,
             port_name,
@@ -71,5 +72,15 @@ impl MidiOut {
         self.connection
             .send(message)
             .map_err(|e| format!("Failed to send MIDI: {}", e))
+    }
+
+    /// Send MIDI Start message.
+    pub fn send_start(&mut self) -> Result<(), String> {
+        self.send(&[MIDI_START])
+    }
+
+    /// Send MIDI Stop message.
+    pub fn send_stop(&mut self) -> Result<(), String> {
+        self.send(&[MIDI_STOP])
     }
 }

@@ -7,10 +7,12 @@ mod clock;
 mod midi;
 mod playback;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use iced::time::{self, milliseconds};
-use iced::widget::{column, container, text};
+use iced::widget::{button, column, container, row, text};
 use iced::{Center, Element, Fill, Subscription, Theme};
 use midir::MidiInput;
 
@@ -33,14 +35,18 @@ struct Looper {
     midi_out_connected: bool,
     in_port_name: String,
     out_port_name: String,
+    master_mode: Arc<AtomicBool>,
     // Keep connections alive
     _midi_in_connection: Option<midir::MidiInputConnection<()>>,
-    _midi_out: Arc<Mutex<Option<MidiOut>>>,
+    midi_out: Arc<Mutex<Option<MidiOut>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum Message {
     Tick,
+    Play,
+    Stop,
+    ToggleClockMode,
 }
 
 impl Looper {
@@ -48,6 +54,7 @@ impl Looper {
         let clock_state = ClockState::new();
         let sequence_player = Arc::new(Mutex::new(SequencePlayer::new()));
         let midi_out = Arc::new(Mutex::new(MidiOut::new().ok()));
+        let master_mode = Arc::new(AtomicBool::new(false));
 
         // Define loops to load: (path, bar_length)
         let loop_configs = [
@@ -101,7 +108,90 @@ impl Looper {
             clock_state.clone(),
             sequence_player.clone(),
             midi_out.clone(),
+            master_mode.clone(),
         );
+
+        // Spawn clock generator thread for master mode
+        {
+            let clock_state = clock_state.clone();
+            let sequence_player = sequence_player.clone();
+            let midi_out = midi_out.clone();
+            let master_mode = master_mode.clone();
+
+            std::thread::spawn(move || {
+                use std::time::Instant;
+
+                const BPM: u64 = 120;
+                const CLOCKS_PER_BEAT: u64 = 24;
+                // Nanoseconds per clock = 60_000_000_000 / (BPM * 24)
+                // For 120 BPM: = 60_000_000_000 / 2880 = 20_833_333.333... ns
+                // We calculate target time from clock count to avoid cumulative drift
+
+                let mut clock_count: u64 = 0;
+                let mut start_time = Instant::now();
+                let mut is_running = false;
+
+                loop {
+                    // Only generate clock when in master mode and running
+                    if master_mode.load(Ordering::SeqCst) && clock_state.is_running() {
+                        if !is_running {
+                            println!("Clock generator: starting clocks");
+                            is_running = true;
+                            clock_count = 0;
+                            start_time = Instant::now();
+                        }
+
+                        // Update internal clock state
+                        clock_state.handle_midi_message(&[midi::MIDI_CLOCK]);
+
+                        // Get events to play at current position
+                        let events = {
+                            let mut player = sequence_player.lock().unwrap();
+                            player.tick(clock_state.get_clock_count())
+                        };
+
+                        // Send clock and events to MIDI output
+                        if let Ok(mut out_guard) = midi_out.lock() {
+                            if let Some(ref mut out) = *out_guard {
+                                // Send clock pulse
+                                if let Err(e) = out.send(&[midi::MIDI_CLOCK]) {
+                                    eprintln!("Failed to send clock: {}", e);
+                                }
+                                // Send note events
+                                for event in &events {
+                                    // Debug: check for unexpected STOP bytes
+                                    if !event.is_empty() && event[0] == midi::MIDI_STOP {
+                                        eprintln!("WARNING: Event contains STOP byte: {:?}", event);
+                                    }
+                                    let _ = out.send(event);
+                                }
+                            }
+                        } else {
+                            eprintln!("Failed to lock midi_out");
+                        }
+
+                        // Calculate next tick time based on clock count (avoids cumulative drift)
+                        clock_count += 1;
+                        // target_nanos = clock_count * 60_000_000_000 / (BPM * CLOCKS_PER_BEAT)
+                        let target_nanos = (clock_count * 60_000_000_000) / (BPM * CLOCKS_PER_BEAT);
+                        let target_time = start_time + Duration::from_nanos(target_nanos);
+
+                        // Sleep until target time
+                        let now = Instant::now();
+                        if target_time > now {
+                            std::thread::sleep(target_time - now);
+                        }
+                    } else {
+                        // Not running - sleep briefly
+                        if is_running {
+                            println!("Clock generator: stopped");
+                            is_running = false;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            });
+        }
 
         Self {
             clock_state,
@@ -110,8 +200,9 @@ impl Looper {
             midi_out_connected,
             in_port_name,
             out_port_name,
+            master_mode,
             _midi_in_connection: midi_in_connection,
-            _midi_out: midi_out,
+            midi_out,
         }
     }
 
@@ -120,6 +211,65 @@ impl Looper {
             Message::Tick => {
                 // State is updated by MIDI thread, just trigger re-render
             }
+            Message::Play => {
+                let is_master = self.master_mode.load(Ordering::SeqCst);
+                let was_running = self.clock_state.is_running();
+                println!("Play clicked: is_master={}, was_running={}", is_master, was_running);
+
+                // Send MIDI messages
+                if let Ok(mut out_guard) = self.midi_out.lock() {
+                    if let Some(ref mut out) = *out_guard {
+                        if was_running {
+                            println!("Sending STOP (restart)");
+                            let _ = out.send_stop();
+                        }
+                        println!("Sending START");
+                        if let Err(e) = out.send_start() {
+                            eprintln!("Failed to send START: {}", e);
+                        }
+                    } else {
+                        eprintln!("No MIDI output available!");
+                    }
+                } else {
+                    eprintln!("Failed to lock midi_out!");
+                }
+
+                // In master mode, directly update clock state (no external clock to trigger it)
+                if is_master {
+                    if was_running {
+                        self.clock_state.handle_midi_message(&[midi::MIDI_STOP]);
+                    }
+                    self.clock_state.handle_midi_message(&[midi::MIDI_START]);
+                    self.sequence_player.lock().unwrap().reset();
+                }
+            }
+            Message::Stop => {
+                let is_master = self.master_mode.load(Ordering::SeqCst);
+                println!("Stop clicked: is_master={}", is_master);
+
+                if let Ok(mut out_guard) = self.midi_out.lock() {
+                    if let Some(ref mut out) = *out_guard {
+                        println!("Sending STOP");
+                        let _ = out.send_stop();
+                    }
+                }
+
+                // In master mode, directly update clock state
+                if is_master {
+                    self.clock_state.handle_midi_message(&[midi::MIDI_STOP]);
+                }
+            }
+            Message::ToggleClockMode => {
+                let current = self.master_mode.load(Ordering::SeqCst);
+                self.master_mode.store(!current, Ordering::SeqCst);
+
+                // If switching to master mode while stopped, ensure clean state
+                if !current {
+                    // Switching to master mode - mark that we've seen transport
+                    // so clock pulses from external source don't auto-start
+                    self.clock_state.handle_midi_message(&[midi::MIDI_STOP]);
+                }
+            }
         }
     }
 
@@ -127,12 +277,19 @@ impl Looper {
         let (bar, beat) = self.clock_state.get_position();
         let bpm = self.clock_state.get_bpm();
         let running = self.clock_state.is_running();
+        let is_master = self.master_mode.load(Ordering::SeqCst);
 
-        let status = if running { "▶ PLAYING" } else { "⏹ STOPPED" };
-        let status_color = if running {
-            iced::Color::from_rgb(0.2, 0.8, 0.2)
+        // Button colors based on transport state
+        let (play_color, stop_color) = if running {
+            (
+                iced::Color::from_rgb(0.2, 0.8, 0.2), // Green when playing
+                iced::Color::from_rgb(0.6, 0.6, 0.6), // Grey
+            )
         } else {
-            iced::Color::from_rgb(0.6, 0.6, 0.6)
+            (
+                iced::Color::from_rgb(0.6, 0.6, 0.6), // Grey
+                iced::Color::from_rgb(0.8, 0.2, 0.2), // Red when stopped
+            )
         };
 
         let in_status = if self.midi_in_connected {
@@ -146,6 +303,21 @@ impl Looper {
         } else {
             "OUT: ❌ Not connected".to_string()
         };
+
+        // Clock mode toggle
+        let clock_mode_label = if is_master {
+            "Clock: MASTER (120 BPM)"
+        } else {
+            "Clock: EXTERNAL"
+        };
+        let clock_mode_color = if is_master {
+            iced::Color::from_rgb(0.8, 0.6, 0.2) // Orange for master
+        } else {
+            iced::Color::from_rgb(0.4, 0.6, 0.8) // Blue for external
+        };
+        let clock_mode_button = button(text(clock_mode_label).size(14).color(clock_mode_color))
+            .padding(8)
+            .on_press(Message::ToggleClockMode);
 
         // Get current sequence state
         let (loop_name, loop_progress) = {
@@ -161,14 +333,24 @@ impl Looper {
             (name, progress)
         };
 
+        // Transport control buttons
+        let play_button = button(text("▶").size(30).color(play_color))
+            .padding(15)
+            .on_press(Message::Play);
+        let stop_button = button(text("⏹").size(30).color(stop_color))
+            .padding(15)
+            .on_press(Message::Stop);
+        let transport_controls = row![play_button, stop_button].spacing(20);
+
         let content = column![
             text("MIDI Looper").size(40),
             text(in_status).size(14),
             text(out_status).size(14),
+            clock_mode_button,
             text("").size(10),
             text(format!("Loop: {} ({})", loop_name, loop_progress)).size(16),
             text("").size(10),
-            text(status).size(30).color(status_color),
+            transport_controls,
             text("").size(10),
             text(format!("BPM: {:.1}", bpm)).size(60),
             text("").size(10),
@@ -203,6 +385,7 @@ fn start_midi_listener(
     clock_state: ClockState,
     sequence_player: Arc<Mutex<SequencePlayer>>,
     midi_out: Arc<Mutex<Option<MidiOut>>>,
+    master_mode: Arc<AtomicBool>,
 ) -> (Option<midir::MidiInputConnection<()>>, String) {
     let midi_in = match MidiInput::new("looper-clock") {
         Ok(m) => m,
@@ -232,6 +415,11 @@ fn start_midi_listener(
         port,
         "looper-clock-in",
         move |_timestamp, message, _| {
+            // In master mode, ignore incoming clock and transport - we generate our own
+            if master_mode.load(Ordering::SeqCst) {
+                return;
+            }
+
             // Update clock state
             clock_state.handle_midi_message(message);
 
