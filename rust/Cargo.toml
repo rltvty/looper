@@ -1,0 +1,20 @@
+[package]
+name = "looper"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# MIDI hardware I/O (ports, real-time messages)
+midir = "0.10"
+
+# MIDI file parsing
+midly = "0.5"
+
+# GUI framework
+iced = { version = "0.14", features = ["tokio"] }
+
+# Async runtime (needed for iced)
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+
+# Error handling
+anyhow = "1"
