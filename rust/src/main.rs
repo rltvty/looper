@@ -6,19 +6,24 @@
 mod clock;
 mod midi;
 mod playback;
+mod ui;
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use iced::keyboard::{self, key::Named, Key};
 use iced::time::{self, milliseconds};
 use iced::widget::{button, column, container, row, text};
-use iced::{Center, Element, Fill, Subscription, Theme};
+use iced::window::{self, Screenshot};
+use iced::{Center, Element, Fill, Subscription, Task, Theme};
 use midir::MidiInput;
 
 use clock::ClockState;
 use midi::MidiOut;
-use playback::{Loop, Sequence, SequenceEntry, SequencePlayer};
+use playback::{Loop, Sequence, SequenceEntry, SequenceGrid, SequencePlayer, SlotId};
+use ui::{view_sequence_table, QuanEditState};
 
 fn main() -> iced::Result {
     iced::application(Looper::new, Looper::update, Looper::view)
@@ -39,14 +44,58 @@ struct Looper {
     // Keep connections alive
     _midi_in_connection: Option<midir::MidiInputConnection<()>>,
     midi_out: Arc<Mutex<Option<MidiOut>>>,
+    // Sequence grid for UI
+    sequence_grid: SequenceGrid,
+    // Screenshot request flag (set by MIDI CC 119)
+    screenshot_requested: Arc<AtomicBool>,
+    // QUAN editing state
+    editing_quan: Option<SlotId>,
+    quan_input: String,
+    // Available loops for dropdown
+    available_loops: Vec<(String, PathBuf)>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum Message {
     Tick,
     Play,
     Stop,
     ToggleClockMode,
+    KeyPressed(Key),
+    ScreenshotCaptured(Screenshot),
+    SetNextSlot(SlotId, Option<SlotId>),
+    StartEditQuan(SlotId),
+    EditQuanValue(String),
+    CommitQuanEdit,
+    SetSlotLoop(SlotId, Option<usize>),
+}
+
+/// Scan for available MIDI loops in the data/out directory.
+fn scan_available_loops() -> Vec<(String, PathBuf)> {
+    let data_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("data/out");
+
+    let mut loops = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(&data_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e == "mid").unwrap_or(false) {
+                let name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Unknown")
+                    .to_string();
+                loops.push((name, path));
+            }
+        }
+    }
+
+    // Sort by name for consistent ordering
+    loops.sort_by(|a, b| a.0.cmp(&b.0));
+    loops
 }
 
 impl Looper {
@@ -55,6 +104,11 @@ impl Looper {
         let sequence_player = Arc::new(Mutex::new(SequencePlayer::new()));
         let midi_out = Arc::new(Mutex::new(MidiOut::new().ok()));
         let master_mode = Arc::new(AtomicBool::new(false));
+        let screenshot_requested = Arc::new(AtomicBool::new(false));
+
+        // Scan for available loops
+        let available_loops = scan_available_loops();
+        println!("Found {} loops in data/out/", available_loops.len());
 
         // Define loops to load: (path, bar_length)
         let loop_configs = [
@@ -109,6 +163,7 @@ impl Looper {
             sequence_player.clone(),
             midi_out.clone(),
             master_mode.clone(),
+            screenshot_requested.clone(),
         );
 
         // Spawn clock generator thread for master mode
@@ -193,6 +248,9 @@ impl Looper {
             });
         }
 
+        // Initialize sequence grid (currently empty - will be populated from UI)
+        let sequence_grid = SequenceGrid::new();
+
         Self {
             clock_state,
             sequence_player,
@@ -203,12 +261,23 @@ impl Looper {
             master_mode,
             _midi_in_connection: midi_in_connection,
             midi_out,
+            sequence_grid,
+            screenshot_requested,
+            editing_quan: None,
+            quan_input: String::new(),
+            available_loops,
         }
     }
 
-    fn update(&mut self, message: Message) {
+    fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Tick => {
+                // Check for MIDI-triggered screenshot request
+                if self.screenshot_requested.swap(false, Ordering::SeqCst) {
+                    return window::oldest().and_then(|window_id| {
+                        window::screenshot(window_id)
+                    }).map(Message::ScreenshotCaptured);
+                }
                 // State is updated by MIDI thread, just trigger re-render
             }
             Message::Play => {
@@ -270,7 +339,72 @@ impl Looper {
                     self.clock_state.handle_midi_message(&[midi::MIDI_STOP]);
                 }
             }
+            Message::KeyPressed(key) => {
+                // F12 triggers screenshot
+                if key == Key::Named(Named::F12) {
+                    return window::oldest().and_then(|window_id| {
+                        window::screenshot(window_id)
+                    }).map(Message::ScreenshotCaptured);
+                }
+            }
+            Message::ScreenshotCaptured(screenshot) => {
+                // Save screenshot to file
+                if let Err(e) = save_screenshot(&screenshot) {
+                    eprintln!("Failed to save screenshot: {}", e);
+                }
+            }
+            Message::SetNextSlot(slot_id, next_slot) => {
+                // Update the grid's NEXT pointer for this slot
+                self.sequence_grid.set_next(slot_id, next_slot);
+            }
+            Message::StartEditQuan(slot_id) => {
+                // Start editing QUAN for this slot
+                let current_value = self.sequence_grid.get(slot_id).repeat_count;
+                self.editing_quan = Some(slot_id);
+                self.quan_input = current_value.to_string();
+            }
+            Message::EditQuanValue(value) => {
+                // Update the input value (only digits allowed)
+                if value.chars().all(|c| c.is_ascii_digit()) {
+                    self.quan_input = value;
+                }
+            }
+            Message::CommitQuanEdit => {
+                // Commit the QUAN edit
+                if let Some(slot_id) = self.editing_quan.take() {
+                    if let Ok(count) = self.quan_input.parse::<u32>() {
+                        // Clamp to valid range (1-999)
+                        let count = count.max(1).min(999);
+                        self.sequence_grid.set_repeat_count(slot_id, count);
+                    }
+                }
+                self.quan_input.clear();
+            }
+            Message::SetSlotLoop(slot_id, loop_index) => {
+                // Load or clear the loop for this slot
+                match loop_index {
+                    Some(idx) => {
+                        if let Some((name, path)) = self.available_loops.get(idx) {
+                            // Default to 4 bars - could be made configurable later
+                            match Loop::from_file(path, 4) {
+                                Ok(mut loaded_loop) => {
+                                    loaded_loop.set_channel(0);
+                                    println!("Loaded loop '{}' into slot {}", name, slot_id);
+                                    self.sequence_grid.load_loop(slot_id, loaded_loop);
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to load loop '{}': {}", name, e);
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        self.sequence_grid.clear_loop(slot_id);
+                    }
+                }
+            }
         }
+        Task::none()
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -342,19 +476,45 @@ impl Looper {
             .on_press(Message::Stop);
         let transport_controls = row![play_button, stop_button].spacing(20);
 
+        // Get playback state for grid highlighting
+        let playback_state = {
+            let player = self.sequence_player.lock().unwrap();
+            player.grid_playback_state()
+        };
+
+        // Sequence table with QUAN editing state
+        let quan_edit = QuanEditState {
+            editing_slot: self.editing_quan,
+            input_value: &self.quan_input,
+        };
+        let sequence_table: Element<'_, Message> = view_sequence_table(
+            &self.sequence_grid,
+            playback_state,
+            &self.available_loops,
+            quan_edit,
+            |slot_id, loop_idx| Message::SetSlotLoop(slot_id, loop_idx),
+            |slot_id, next_slot| Message::SetNextSlot(slot_id, next_slot),
+            |slot_id| Message::StartEditQuan(slot_id),
+            Message::EditQuanValue,
+            Message::CommitQuanEdit,
+        );
+
         let content = column![
-            text("MIDI Looper").size(40),
-            text(in_status).size(14),
-            text(out_status).size(14),
+            text("MIDI Looper").size(32),
+            text(in_status).size(12),
+            text(out_status).size(12),
             clock_mode_button,
-            text("").size(10),
-            text(format!("Loop: {} ({})", loop_name, loop_progress)).size(16),
-            text("").size(10),
+            text("").size(5),
+            row![
+                text(format!("BPM: {:.1}", bpm)).size(24),
+                text(format!("Bar {} · Beat {}", bar, beat)).size(24),
+            ].spacing(20),
+            text("").size(5),
             transport_controls,
+            text("").size(5),
+            text(format!("Loop: {} ({})", loop_name, loop_progress)).size(14),
             text("").size(10),
-            text(format!("BPM: {:.1}", bpm)).size(60),
-            text("").size(10),
-            text(format!("Bar {} · Beat {}", bar, beat)).size(40),
+            sequence_table,
         ]
         .align_x(Center);
 
@@ -367,7 +527,15 @@ impl Looper {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        time::every(milliseconds(50)).map(|_| Message::Tick)
+        let tick = time::every(milliseconds(50)).map(|_| Message::Tick);
+        let keyboard = keyboard::listen().map(|event| {
+            if let keyboard::Event::KeyPressed { key, .. } = event {
+                Message::KeyPressed(key)
+            } else {
+                Message::Tick // Ignore other keyboard events
+            }
+        });
+        Subscription::batch([tick, keyboard])
     }
 
     fn theme(&self) -> Theme {
@@ -381,11 +549,38 @@ impl Default for Looper {
     }
 }
 
+/// Save a screenshot to the screenshots/ directory with timestamp filename.
+fn save_screenshot(screenshot: &Screenshot) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    // Use manifest directory at compile time for consistent path
+    let project_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let screenshots_dir = project_dir.join("screenshots");
+    std::fs::create_dir_all(&screenshots_dir)?;
+
+    // Generate timestamp filename
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let filename = format!("looper_{}.png", timestamp);
+    let path = screenshots_dir.join(&filename);
+
+    // Get screenshot dimensions and bytes
+    let width = screenshot.size.width;
+    let height = screenshot.size.height;
+    let rgba_bytes: &[u8] = screenshot.as_ref();
+
+    // Save as PNG using image crate
+    let img = image::RgbaImage::from_raw(width, height, rgba_bytes.to_vec())
+        .ok_or("Failed to create image from screenshot bytes")?;
+    img.save(&path)?;
+
+    println!("Screenshot saved: {}", path.display());
+    Ok(path)
+}
+
 fn start_midi_listener(
     clock_state: ClockState,
     sequence_player: Arc<Mutex<SequencePlayer>>,
     midi_out: Arc<Mutex<Option<MidiOut>>>,
     master_mode: Arc<AtomicBool>,
+    screenshot_requested: Arc<AtomicBool>,
 ) -> (Option<midir::MidiInputConnection<()>>, String) {
     let midi_in = match MidiInput::new("looper-clock") {
         Ok(m) => m,
@@ -415,6 +610,12 @@ fn start_midi_listener(
         port,
         "looper-clock-in",
         move |_timestamp, message, _| {
+            // Check for screenshot trigger (CC 119 value 127)
+            if midi::is_screenshot_trigger(message) {
+                screenshot_requested.store(true, Ordering::SeqCst);
+                return;
+            }
+
             // In master mode, ignore incoming clock and transport - we generate our own
             if master_mode.load(Ordering::SeqCst) {
                 return;

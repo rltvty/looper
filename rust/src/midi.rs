@@ -20,6 +20,20 @@ pub const MIDI_STOP: u8 = 0xFC;
 /// Number of MIDI clock pulses per quarter note (beat)
 pub const CLOCKS_PER_BEAT: u64 = 24;
 
+/// MIDI Control Change status byte mask (0xBn where n is channel)
+pub const MIDI_CC_MASK: u8 = 0xB0;
+
+/// CC number for screenshot trigger
+pub const CC_SCREENSHOT: u8 = 119;
+
+/// Check if a MIDI message is CC 119 with value 127 (screenshot trigger)
+pub fn is_screenshot_trigger(message: &[u8]) -> bool {
+    message.len() == 3
+        && (message[0] & 0xF0) == MIDI_CC_MASK
+        && message[1] == CC_SCREENSHOT
+        && message[2] == 127
+}
+
 /// Beats per bar (assuming 4/4 time signature)
 pub const BEATS_PER_BAR: u64 = 4;
 

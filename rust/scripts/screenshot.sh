@@ -4,7 +4,11 @@
 #
 # Captures a screenshot of the MIDI Looper window (or full screen as fallback)
 
-SCREENSHOTS_DIR="screenshots"
+# Get the directory where this script lives
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+
+SCREENSHOTS_DIR="$PROJECT_DIR/screenshots"
 mkdir -p "$SCREENSHOTS_DIR"
 
 if [ -n "$1" ]; then
