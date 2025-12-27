@@ -22,7 +22,7 @@ use midir::MidiInput;
 
 use clock::ClockState;
 use midi::MidiOut;
-use playback::{Loop, Sequence, SequenceEntry, SequenceGrid, SequencePlayer, SlotId};
+use playback::{Loop, SequenceGrid, SequencePlayer, SlotId};
 use ui::{view_sequence_table, QuanEditState};
 
 fn main() -> iced::Result {
@@ -110,42 +110,13 @@ impl Looper {
         let available_loops = scan_available_loops();
         println!("Found {} loops in data/out/", available_loops.len());
 
-        // Define loops to load: (path, bar_length)
-        let loop_configs = [
-            ("../data/out/Billie Jean - bass - Bass finger - bars 15-26.mid", 12),
-            ("../data/out/Psycho Killer - bass - Bass - Tina Weymouth - bars 107-110.mid", 4),
-            ("../data/out/Rappers Delight - bass - Electric Bass finger - bars 13-16.mid", 4),
-            ("../data/out/Seven Nation Army With Bass Guitar - bass - Jack White Bass Immitation - bars 1-4.mid", 4),
-        ];
-        let repeat_count = 2;
+        // Initialize empty grid - user will load loops via UI
+        let sequence_grid = SequenceGrid::new();
 
-        // Load all loops
-        let mut entries = Vec::new();
-        for (path, bars) in &loop_configs {
-            match Loop::from_file(path, *bars) {
-                Ok(mut loaded_loop) => {
-                    loaded_loop.set_channel(0); // MIDI channel 1 (0-indexed)
-                    println!(
-                        "Loaded loop: {} ({} events, {} clocks)",
-                        loaded_loop.name,
-                        loaded_loop.events.len(),
-                        loaded_loop.length_clocks
-                    );
-                    entries.push(SequenceEntry {
-                        loop_data: loaded_loop,
-                        repeat_count,
-                    });
-                }
-                Err(e) => {
-                    eprintln!("Failed to load loop {}: {}", path, e);
-                }
-            }
-        }
-
-        if !entries.is_empty() {
-            let sequence = Sequence { entries };
+        // Load grid into player (starts empty, user adds loops)
+        {
             let mut player = sequence_player.lock().unwrap();
-            player.load(sequence);
+            player.load_grid(sequence_grid.clone());
             player.start();
         }
 
@@ -241,15 +212,18 @@ impl Looper {
                         if is_running {
                             println!("Clock generator: stopped");
                             is_running = false;
+                            // Send All Notes Off to avoid stuck notes
+                            if let Ok(mut out_guard) = midi_out.lock() {
+                                if let Some(ref mut out) = *out_guard {
+                                    let _ = out.send(&[0xB0, 123, 0]);
+                                }
+                            }
                         }
                         std::thread::sleep(Duration::from_millis(1));
                     }
                 }
             });
         }
-
-        // Initialize sequence grid (currently empty - will be populated from UI)
-        let sequence_grid = SequenceGrid::new();
 
         Self {
             clock_state,
@@ -318,6 +292,8 @@ impl Looper {
 
                 if let Ok(mut out_guard) = self.midi_out.lock() {
                     if let Some(ref mut out) = *out_guard {
+                        // Send All Notes Off (CC 123) on channel 0 to avoid stuck notes
+                        let _ = out.send(&[0xB0, 123, 0]);
                         println!("Sending STOP");
                         let _ = out.send_stop();
                     }
@@ -356,6 +332,8 @@ impl Looper {
             Message::SetNextSlot(slot_id, next_slot) => {
                 // Update the grid's NEXT pointer for this slot
                 self.sequence_grid.set_next(slot_id, next_slot);
+                // Sync grid to player
+                self.sequence_player.lock().unwrap().update_grid(self.sequence_grid.clone());
             }
             Message::StartEditQuan(slot_id) => {
                 // Start editing QUAN for this slot
@@ -376,6 +354,8 @@ impl Looper {
                         // Clamp to valid range (1-999)
                         let count = count.max(1).min(999);
                         self.sequence_grid.set_repeat_count(slot_id, count);
+                        // Sync grid to player
+                        self.sequence_player.lock().unwrap().update_grid(self.sequence_grid.clone());
                     }
                 }
                 self.quan_input.clear();
@@ -402,6 +382,8 @@ impl Looper {
                         self.sequence_grid.clear_loop(slot_id);
                     }
                 }
+                // Sync grid to player
+                self.sequence_player.lock().unwrap().update_grid(self.sequence_grid.clone());
             }
         }
         Task::none()
@@ -453,20 +435,6 @@ impl Looper {
             .padding(8)
             .on_press(Message::ToggleClockMode);
 
-        // Get current sequence state
-        let (loop_name, loop_progress) = {
-            let player = self.sequence_player.lock().unwrap();
-            let name = player
-                .current_loop_name()
-                .unwrap_or("No sequence loaded")
-                .to_string();
-            let progress = player
-                .current_state()
-                .map(|(_, iter, total)| format!("{}/{}", iter, total))
-                .unwrap_or_default();
-            (name, progress)
-        };
-
         // Transport control buttons
         let play_button = button(text("▶").size(30).color(play_color))
             .padding(15)
@@ -511,8 +479,6 @@ impl Looper {
             ].spacing(20),
             text("").size(5),
             transport_controls,
-            text("").size(5),
-            text(format!("Loop: {} ({})", loop_name, loop_progress)).size(14),
             text("").size(10),
             sequence_table,
         ]
@@ -655,6 +621,15 @@ fn start_midi_listener(
             if !message.is_empty() && message[0] == midi::MIDI_START {
                 let mut player = sequence_player.lock().unwrap();
                 player.reset();
+            }
+
+            // Send All Notes Off on transport stop to avoid stuck notes
+            if !message.is_empty() && message[0] == midi::MIDI_STOP {
+                if let Ok(mut out_guard) = midi_out.lock() {
+                    if let Some(ref mut out) = *out_guard {
+                        let _ = out.send(&[0xB0, 123, 0]); // All Notes Off on channel 0
+                    }
+                }
             }
         },
         (),
