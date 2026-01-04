@@ -37,6 +37,21 @@ pub fn is_screenshot_trigger(message: &[u8]) -> bool {
 /// Beats per bar (assuming 4/4 time signature)
 pub const BEATS_PER_BAR: u64 = 4;
 
+/// Scan for available MIDI output ports.
+/// Returns a list of (port_name, display_name) tuples.
+pub fn scan_output_ports() -> Vec<String> {
+    let midi_out = match MidiOutput::new("looper-scan") {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+
+    midi_out
+        .ports()
+        .iter()
+        .filter_map(|p| midi_out.port_name(p).ok())
+        .collect()
+}
+
 /// Wrapper for MIDI output connection.
 pub struct MidiOut {
     connection: MidiOutputConnection,
@@ -46,6 +61,11 @@ pub struct MidiOut {
 impl MidiOut {
     /// Create a new MIDI output, preferring IAC Driver on macOS.
     pub fn new() -> Result<Self, String> {
+        Self::connect_to_port(None)
+    }
+
+    /// Connect to a specific port by name, or IAC Driver if None.
+    pub fn connect_to_port(port_name: Option<&str>) -> Result<Self, String> {
         let midi_out = MidiOutput::new("looper-out")
             .map_err(|e| format!("Failed to create MIDI output: {}", e))?;
 
@@ -54,19 +74,32 @@ impl MidiOut {
             return Err("No MIDI output ports found".to_string());
         }
 
-        // Look for IAC Driver or use first port
-        let port_idx = ports
-            .iter()
-            .position(|p| {
-                midi_out
-                    .port_name(p)
-                    .map(|n| n.contains("IAC"))
-                    .unwrap_or(false)
-            })
-            .unwrap_or(0);
+        // Find the requested port, or fall back to IAC Driver, or first port
+        let port_idx = if let Some(name) = port_name {
+            ports
+                .iter()
+                .position(|p| {
+                    midi_out
+                        .port_name(p)
+                        .map(|n| n == name)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(0)
+        } else {
+            // Look for IAC Driver or use first port
+            ports
+                .iter()
+                .position(|p| {
+                    midi_out
+                        .port_name(p)
+                        .map(|n| n.contains("IAC"))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(0)
+        };
 
         let port = &ports[port_idx];
-        let port_name = midi_out
+        let actual_port_name = midi_out
             .port_name(port)
             .unwrap_or_else(|_| "Unknown".to_string());
 
@@ -74,10 +107,10 @@ impl MidiOut {
             .connect(port, "looper-out")
             .map_err(|e| format!("Failed to connect MIDI output: {}", e))?;
 
-        println!("MIDI Output connected to: {}", port_name);
+        println!("MIDI Output connected to: {}", actual_port_name);
         Ok(Self {
             connection,
-            port_name,
+            port_name: actual_port_name,
         })
     }
 

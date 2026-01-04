@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use iced::keyboard::{self, key::Named, Key};
 use iced::time::{self, milliseconds};
-use iced::widget::{button, column, container, row, text};
+use iced::widget::{button, column, container, pick_list, row, text};
 use iced::window::{self, Screenshot};
 use iced::{Center, Element, Fill, Subscription, Task, Theme};
 use midir::MidiInput;
@@ -23,7 +23,7 @@ use midir::MidiInput;
 use clock::ClockState;
 use midi::MidiOut;
 use playback::{Loop, SequenceGrid, SequencePlayer, SlotId};
-use ui::{view_sequence_table, QuanEditState};
+use ui::view_sequence_table;
 
 fn main() -> iced::Result {
     iced::application(Looper::new, Looper::update, Looper::view)
@@ -48,11 +48,12 @@ struct Looper {
     sequence_grid: SequenceGrid,
     // Screenshot request flag (set by MIDI CC 119)
     screenshot_requested: Arc<AtomicBool>,
-    // QUAN editing state
-    editing_quan: Option<SlotId>,
-    quan_input: String,
     // Available loops for dropdown
     available_loops: Vec<(String, PathBuf)>,
+    // MIDI output routing
+    available_outputs: Vec<String>,
+    selected_output: usize,
+    output_channel: u8, // 0-15 (displayed as 1-16)
 }
 
 #[derive(Debug, Clone)]
@@ -64,10 +65,11 @@ enum Message {
     KeyPressed(Key),
     ScreenshotCaptured(Screenshot),
     SetNextSlot(SlotId, Option<SlotId>),
-    StartEditQuan(SlotId),
-    EditQuanValue(String),
-    CommitQuanEdit,
+    DecrementQuan(SlotId),
+    IncrementQuan(SlotId),
     SetSlotLoop(SlotId, Option<usize>),
+    SetOutputDevice(usize),
+    SetOutputChannel(u8),
 }
 
 /// Scan for available MIDI loops in the data/out directory.
@@ -98,13 +100,54 @@ fn scan_available_loops() -> Vec<(String, PathBuf)> {
     loops
 }
 
+/// Wrapper for output device dropdown options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OutputDeviceOption {
+    index: usize,
+    name: String,
+}
+
+impl std::fmt::Display for OutputDeviceOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name)
+    }
+}
+
+/// Wrapper for MIDI channel dropdown options (1-16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChannelOption(u8);
+
+impl std::fmt::Display for ChannelOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Ch {}", self.0 + 1) // Display as 1-16
+    }
+}
+
 impl Looper {
     fn new() -> Self {
         let clock_state = ClockState::new();
         let sequence_player = Arc::new(Mutex::new(SequencePlayer::new()));
-        let midi_out = Arc::new(Mutex::new(MidiOut::new().ok()));
         let master_mode = Arc::new(AtomicBool::new(false));
         let screenshot_requested = Arc::new(AtomicBool::new(false));
+
+        // Scan for available MIDI output ports
+        let available_outputs = midi::scan_output_ports();
+        println!("Found {} MIDI output ports", available_outputs.len());
+        for (i, name) in available_outputs.iter().enumerate() {
+            println!("  {}: {}", i, name);
+        }
+
+        // Find IAC Driver index as default, or use 0
+        let selected_output = available_outputs
+            .iter()
+            .position(|n| n.contains("IAC"))
+            .unwrap_or(0);
+        let output_channel: u8 = 0; // Default to channel 1 (0-indexed)
+
+        // Connect to the selected output
+        let midi_out = Arc::new(Mutex::new(
+            MidiOut::connect_to_port(available_outputs.get(selected_output).map(|s| s.as_str())).ok()
+        ));
 
         // Scan for available loops
         let available_loops = scan_available_loops();
@@ -237,9 +280,10 @@ impl Looper {
             midi_out,
             sequence_grid,
             screenshot_requested,
-            editing_quan: None,
-            quan_input: String::new(),
             available_loops,
+            available_outputs,
+            selected_output,
+            output_channel,
         }
     }
 
@@ -335,30 +379,19 @@ impl Looper {
                 // Sync grid to player
                 self.sequence_player.lock().unwrap().update_grid(self.sequence_grid.clone());
             }
-            Message::StartEditQuan(slot_id) => {
-                // Start editing QUAN for this slot
-                let current_value = self.sequence_grid.get(slot_id).repeat_count;
-                self.editing_quan = Some(slot_id);
-                self.quan_input = current_value.to_string();
-            }
-            Message::EditQuanValue(value) => {
-                // Update the input value (only digits allowed)
-                if value.chars().all(|c| c.is_ascii_digit()) {
-                    self.quan_input = value;
+            Message::DecrementQuan(slot_id) => {
+                let current = self.sequence_grid.get(slot_id).repeat_count;
+                if current > 1 {
+                    self.sequence_grid.set_repeat_count(slot_id, current - 1);
+                    self.sequence_player.lock().unwrap().update_grid(self.sequence_grid.clone());
                 }
             }
-            Message::CommitQuanEdit => {
-                // Commit the QUAN edit
-                if let Some(slot_id) = self.editing_quan.take() {
-                    if let Ok(count) = self.quan_input.parse::<u32>() {
-                        // Clamp to valid range (1-999)
-                        let count = count.max(1).min(999);
-                        self.sequence_grid.set_repeat_count(slot_id, count);
-                        // Sync grid to player
-                        self.sequence_player.lock().unwrap().update_grid(self.sequence_grid.clone());
-                    }
+            Message::IncrementQuan(slot_id) => {
+                let current = self.sequence_grid.get(slot_id).repeat_count;
+                if current < 999 {
+                    self.sequence_grid.set_repeat_count(slot_id, current + 1);
+                    self.sequence_player.lock().unwrap().update_grid(self.sequence_grid.clone());
                 }
-                self.quan_input.clear();
             }
             Message::SetSlotLoop(slot_id, loop_index) => {
                 // Load or clear the loop for this slot
@@ -368,7 +401,7 @@ impl Looper {
                             // Default to 4 bars - could be made configurable later
                             match Loop::from_file(path, 4) {
                                 Ok(mut loaded_loop) => {
-                                    loaded_loop.set_channel(0);
+                                    loaded_loop.set_channel(self.output_channel);
                                     println!("Loaded loop '{}' into slot {}", name, slot_id);
                                     self.sequence_grid.load_loop(slot_id, loaded_loop);
                                 }
@@ -380,6 +413,57 @@ impl Looper {
                     }
                     None => {
                         self.sequence_grid.clear_loop(slot_id);
+                    }
+                }
+                // Sync grid to player
+                self.sequence_player.lock().unwrap().update_grid(self.sequence_grid.clone());
+            }
+            Message::SetOutputDevice(idx) => {
+                if idx < self.available_outputs.len() {
+                    // Send All Notes Off on current output before switching
+                    if let Ok(mut out_guard) = self.midi_out.lock() {
+                        if let Some(ref mut out) = *out_guard {
+                            let _ = out.send(&[0xB0 | self.output_channel, 123, 0]);
+                        }
+                    }
+
+                    self.selected_output = idx;
+                    let port_name = &self.available_outputs[idx];
+                    println!("Switching MIDI output to: {}", port_name);
+
+                    // Reconnect to new output
+                    match MidiOut::connect_to_port(Some(port_name)) {
+                        Ok(new_out) => {
+                            self.out_port_name = new_out.port_name.clone();
+                            self.midi_out_connected = true;
+                            *self.midi_out.lock().unwrap() = Some(new_out);
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to connect to {}: {}", port_name, e);
+                            self.midi_out_connected = false;
+                            *self.midi_out.lock().unwrap() = None;
+                        }
+                    }
+                }
+            }
+            Message::SetOutputChannel(channel) => {
+                let old_channel = self.output_channel;
+                let new_channel = channel.min(15); // Clamp to 0-15
+
+                // Send All Notes Off on OLD channel before switching
+                if let Ok(mut out_guard) = self.midi_out.lock() {
+                    if let Some(ref mut out) = *out_guard {
+                        let _ = out.send(&[0xB0 | old_channel, 123, 0]);
+                    }
+                }
+
+                self.output_channel = new_channel;
+                println!("Set MIDI output channel to: {}", new_channel + 1);
+
+                // Update channel for all loaded loops in the grid
+                for slot in &mut self.sequence_grid.slots {
+                    if let Some(ref mut loop_data) = slot.loop_data {
+                        loop_data.set_channel(self.output_channel);
                     }
                 }
                 // Sync grid to player
@@ -414,12 +498,6 @@ impl Looper {
             "IN: ❌ Not connected".to_string()
         };
 
-        let out_status = if self.midi_out_connected {
-            format!("OUT: {}", self.out_port_name)
-        } else {
-            "OUT: ❌ Not connected".to_string()
-        };
-
         // Clock mode toggle
         let clock_mode_label = if is_master {
             "Clock: MASTER (120 BPM)"
@@ -444,33 +522,63 @@ impl Looper {
             .on_press(Message::Stop);
         let transport_controls = row![play_button, stop_button].spacing(20);
 
+        // Output device dropdown
+        let output_options: Vec<OutputDeviceOption> = self
+            .available_outputs
+            .iter()
+            .enumerate()
+            .map(|(i, name)| OutputDeviceOption {
+                index: i,
+                name: name.clone(),
+            })
+            .collect();
+        let selected_device = output_options.get(self.selected_output).cloned();
+        let output_picker = pick_list(
+            output_options,
+            selected_device,
+            |opt| Message::SetOutputDevice(opt.index),
+        )
+        .placeholder("Select output...")
+        .width(200);
+
+        // Channel dropdown (1-16)
+        let channel_options: Vec<ChannelOption> = (0..16).map(ChannelOption).collect();
+        let selected_channel = Some(ChannelOption(self.output_channel));
+        let channel_picker = pick_list(
+            channel_options,
+            selected_channel,
+            |opt| Message::SetOutputChannel(opt.0),
+        )
+        .width(80);
+
+        let output_row = row![
+            text("Output:").size(14),
+            output_picker,
+            channel_picker,
+        ]
+        .spacing(10)
+        .align_y(iced::Center);
+
         // Get playback state for grid highlighting
         let playback_state = {
             let player = self.sequence_player.lock().unwrap();
             player.grid_playback_state()
         };
 
-        // Sequence table with QUAN editing state
-        let quan_edit = QuanEditState {
-            editing_slot: self.editing_quan,
-            input_value: &self.quan_input,
-        };
+        // Sequence table
         let sequence_table: Element<'_, Message> = view_sequence_table(
             &self.sequence_grid,
             playback_state,
             &self.available_loops,
-            quan_edit,
             |slot_id, loop_idx| Message::SetSlotLoop(slot_id, loop_idx),
             |slot_id, next_slot| Message::SetNextSlot(slot_id, next_slot),
-            |slot_id| Message::StartEditQuan(slot_id),
-            Message::EditQuanValue,
-            Message::CommitQuanEdit,
+            |slot_id| Message::DecrementQuan(slot_id),
+            |slot_id| Message::IncrementQuan(slot_id),
         );
 
         let content = column![
             text("MIDI Looper").size(32),
             text(in_status).size(12),
-            text(out_status).size(12),
             clock_mode_button,
             text("").size(5),
             row![
@@ -479,6 +587,8 @@ impl Looper {
             ].spacing(20),
             text("").size(5),
             transport_controls,
+            text("").size(5),
+            output_row,
             text("").size(10),
             sequence_table,
         ]

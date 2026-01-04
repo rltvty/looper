@@ -3,7 +3,7 @@
 //! Renders a scrollable table of sequence slots (A-Z) with columns for
 //! loop name, length, repeat count, and next slot.
 
-use iced::widget::{button, column, container, pick_list, row, scrollable, text, text_input, Column};
+use iced::widget::{button, column, container, pick_list, row, scrollable, text, Column};
 use iced::{Background, Border, Color, Element, Length, Theme};
 use std::fmt;
 
@@ -147,11 +147,6 @@ fn view_table_header<'a, M: 'a>() -> Element<'a, M> {
     .into()
 }
 
-/// QUAN editing state for a row.
-pub struct QuanEditState<'a> {
-    pub editing_slot: Option<SlotId>,
-    pub input_value: &'a str,
-}
 
 /// Render a single table row for a slot.
 fn view_slot_row<'a, M: 'a + Clone>(
@@ -165,10 +160,8 @@ fn view_slot_row<'a, M: 'a + Clone>(
     loop_options: Vec<LoopOption>,
     on_loop_change: impl Fn(SlotId, LoopOption) -> M + 'a,
     on_next_change: impl Fn(SlotId, NextSlotOption) -> M + 'a,
-    quan_edit: &QuanEditState<'a>,
-    on_quan_click: M,
-    on_quan_input: impl Fn(String) -> M + 'a,
-    on_quan_submit: M,
+    on_quan_decrement: M,
+    on_quan_increment: M,
 ) -> Element<'a, M> {
     let bg_color = row_background(is_playing, is_next);
     let txt_color = cell_color();
@@ -190,25 +183,35 @@ fn view_slot_row<'a, M: 'a + Clone>(
     .text_size(12)
     .width(Length::Fixed(COL_NEXT_WIDTH - 8.0));
 
-    // QUAN cell: text_input when editing, button otherwise
-    let quan_cell: Element<'a, M> = if quan_edit.editing_slot == Some(slot_id) {
-        text_input("", quan_edit.input_value)
-            .on_input(on_quan_input)
-            .on_submit(on_quan_submit)
-            .size(12)
-            .width(Length::Fixed(COL_QUAN_WIDTH - 16.0))
-            .into()
-    } else {
-        button(text(format!("{}x", repeat_count)).size(14).color(txt_color))
-            .on_press(on_quan_click)
-            .padding([2, 4])
-            .style(move |_theme, _status| button::Style {
-                background: None,
-                text_color: txt_color,
-                ..Default::default()
-            })
-            .into()
-    };
+    // QUAN cell: - [count] + buttons
+    let minus_btn = button(text("-").size(12).color(txt_color))
+        .on_press(on_quan_decrement)
+        .padding([1, 4])
+        .style(move |_theme, _status| button::Style {
+            background: Some(Background::Color(Color::from_rgb(0.25, 0.25, 0.25))),
+            text_color: txt_color,
+            border: Border::default().rounded(2),
+            ..Default::default()
+        });
+
+    let plus_btn = button(text("+").size(12).color(txt_color))
+        .on_press(on_quan_increment)
+        .padding([1, 4])
+        .style(move |_theme, _status| button::Style {
+            background: Some(Background::Color(Color::from_rgb(0.25, 0.25, 0.25))),
+            text_color: txt_color,
+            border: Border::default().rounded(2),
+            ..Default::default()
+        });
+
+    let quan_cell: Element<'a, M> = row![
+        minus_btn,
+        text(format!("{}", repeat_count)).size(12).color(txt_color),
+        plus_btn,
+    ]
+    .spacing(2)
+    .align_y(iced::Center)
+    .into();
 
     container(
         row![
@@ -252,19 +255,16 @@ fn view_slot_row<'a, M: 'a + Clone>(
 /// Callbacks:
 /// - `on_loop_change`: invoked when user changes a slot's loop
 /// - `on_next_change`: invoked when user changes a slot's NEXT pointer
-/// - `on_quan_click`: invoked when user clicks a QUAN cell to start editing
-/// - `on_quan_input`: invoked when user types in the QUAN text input
-/// - `on_quan_submit`: invoked when user presses Enter to commit QUAN edit
+/// - `on_quan_decrement`: invoked when user clicks - to decrease repeat count
+/// - `on_quan_increment`: invoked when user clicks + to increase repeat count
 pub fn view_sequence_table<'a, M: 'a + Clone>(
     grid: &SequenceGrid,
     playback_state: Option<PlaybackState>,
     available_loops: &[(String, std::path::PathBuf)],
-    quan_edit: QuanEditState<'a>,
     on_loop_change: impl Fn(SlotId, Option<usize>) -> M + 'a + Copy,
     on_next_change: impl Fn(SlotId, Option<SlotId>) -> M + 'a + Copy,
-    on_quan_click: impl Fn(SlotId) -> M + 'a + Copy,
-    on_quan_input: impl Fn(String) -> M + 'a + Copy,
-    on_quan_submit: M,
+    on_quan_decrement: impl Fn(SlotId) -> M + 'a + Copy,
+    on_quan_increment: impl Fn(SlotId) -> M + 'a + Copy,
 ) -> Element<'a, M> {
     let current_slot = playback_state.map(|s| s.current_slot);
     let next_slot = playback_state.and_then(|s| grid.get(s.current_slot).next_slot);
@@ -291,10 +291,8 @@ pub fn view_sequence_table<'a, M: 'a + Clone>(
                 loop_options.clone(),
                 move |slot_id, opt| on_loop_change(slot_id, opt.index),
                 move |slot_id, opt| on_next_change(slot_id, opt.0),
-                &quan_edit,
-                on_quan_click(slot.id),
-                on_quan_input,
-                on_quan_submit.clone(),
+                on_quan_decrement(slot.id),
+                on_quan_increment(slot.id),
             )
         })
         .collect();
