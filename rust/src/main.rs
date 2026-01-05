@@ -45,11 +45,14 @@ struct Looper {
     master_mode: Arc<AtomicBool>,
     // Keep connections alive
     _midi_in_connection: Option<midir::MidiInputConnection<()>>,
+    _cc_listener_connection: Option<midir::MidiInputConnection<()>>,
     midi_out: Arc<Mutex<Option<MidiOut>>>,
     // Sequence grid for UI
     sequence_grid: SequenceGrid,
     // Screenshot request flag (set by MIDI CC 119)
     screenshot_requested: Arc<AtomicBool>,
+    // Mute state (toggled by CC 94)
+    muted: Arc<AtomicBool>,
     // Available loops for dropdown (name, optional path - None for built-ins)
     available_loops: Vec<(String, Option<PathBuf>)>,
     // MIDI output routing
@@ -153,6 +156,7 @@ impl Looper {
         let sequence_player = Arc::new(Mutex::new(SequencePlayer::new()));
         let master_mode = Arc::new(AtomicBool::new(false));
         let screenshot_requested = Arc::new(AtomicBool::new(false));
+        let muted = Arc::new(AtomicBool::new(false));
 
         // Load saved configuration
         let config_path = LooperConfig::default_path();
@@ -271,7 +275,15 @@ impl Looper {
             midi_out.clone(),
             master_mode.clone(),
             screenshot_requested.clone(),
+            muted.clone(),
         );
+
+        // Start CC listener on the output device to receive mute commands
+        let cc_listener_connection = if let Some(device_name) = available_outputs.get(selected_output) {
+            start_cc_listener(device_name, output_channel, muted.clone(), midi_out.clone())
+        } else {
+            None
+        };
 
         // Spawn clock generator thread for master mode
         {
@@ -279,6 +291,7 @@ impl Looper {
             let sequence_player = sequence_player.clone();
             let midi_out = midi_out.clone();
             let master_mode = master_mode.clone();
+            let muted = muted.clone();
 
             std::thread::spawn(move || {
                 use std::time::Instant;
@@ -319,13 +332,15 @@ impl Looper {
                                 if let Err(e) = out.send(&[midi::MIDI_CLOCK]) {
                                     eprintln!("Failed to send clock: {}", e);
                                 }
-                                // Send note events
-                                for event in &events {
-                                    // Debug: check for unexpected STOP bytes
-                                    if !event.is_empty() && event[0] == midi::MIDI_STOP {
-                                        eprintln!("WARNING: Event contains STOP byte: {:?}", event);
+                                // Send note events only if not muted
+                                if !muted.load(Ordering::SeqCst) {
+                                    for event in &events {
+                                        // Debug: check for unexpected STOP bytes
+                                        if !event.is_empty() && event[0] == midi::MIDI_STOP {
+                                            eprintln!("WARNING: Event contains STOP byte: {:?}", event);
+                                        }
+                                        let _ = out.send(event);
                                     }
-                                    let _ = out.send(event);
                                 }
                             }
                         } else {
@@ -370,9 +385,11 @@ impl Looper {
             out_port_name,
             master_mode,
             _midi_in_connection: midi_in_connection,
+            _cc_listener_connection: cc_listener_connection,
             midi_out,
             sequence_grid,
             screenshot_requested,
+            muted,
             available_loops,
             available_outputs,
             selected_output,
@@ -712,6 +729,7 @@ impl Looper {
         };
 
         // Build countdown display text (bars.beats remaining until transition)
+        let is_muted = self.muted.load(Ordering::SeqCst);
         let countdown_text = if running {
             if let Some(ref state) = playback_state {
                 let slot_name = self.sequence_grid.get(state.current_slot).loop_name();
@@ -726,12 +744,13 @@ impl Looper {
                 let bars_remaining = (state.total_iterations - state.current_iteration) * state.total_bars
                     + (state.total_bars - state.current_bar + offset);
                 let beats_remaining = 4 + offset - state.current_beat;
-                format!("{}: {}.{}", display_name, bars_remaining, beats_remaining)
+                let mute_indicator = if is_muted { " [MUTED]" } else { "" };
+                format!("{}: {}.{}{}", display_name, bars_remaining, beats_remaining, mute_indicator)
             } else {
-                "No loop playing".to_string()
+                if is_muted { "No loop playing [MUTED]".to_string() } else { "No loop playing".to_string() }
             }
         } else {
-            "Stopped".to_string()
+            if is_muted { "Stopped [MUTED]".to_string() } else { "Stopped".to_string() }
         };
 
         // Sequence table
@@ -828,6 +847,7 @@ fn start_midi_listener(
     midi_out: Arc<Mutex<Option<MidiOut>>>,
     master_mode: Arc<AtomicBool>,
     screenshot_requested: Arc<AtomicBool>,
+    muted: Arc<AtomicBool>,
 ) -> (Option<midir::MidiInputConnection<()>>, String) {
     let midi_in = match MidiInput::new("looper-clock") {
         Ok(m) => m,
@@ -863,6 +883,27 @@ fn start_midi_listener(
                 return;
             }
 
+            // Check for mute toggle (CC 94: value 1 = mute, value 0 = unmute)
+            if message.len() >= 3 && (message[0] & 0xF0) == 0xB0 && message[1] == 94 {
+                let should_mute = message[2] > 0;
+                let was_muted = muted.load(Ordering::SeqCst);
+
+                if should_mute && !was_muted {
+                    // Transitioning to muted - send All Notes Off
+                    println!("Muting MIDI output");
+                    if let Ok(mut out_guard) = midi_out.lock() {
+                        if let Some(ref mut out) = *out_guard {
+                            let _ = out.send(&[0xB0, 123, 0]); // All Notes Off
+                        }
+                    }
+                } else if !should_mute && was_muted {
+                    println!("Unmuting MIDI output");
+                }
+
+                muted.store(should_mute, Ordering::SeqCst);
+                return;
+            }
+
             // In master mode, ignore incoming clock and transport - we generate our own
             if master_mode.load(Ordering::SeqCst) {
                 return;
@@ -886,8 +927,8 @@ fn start_midi_listener(
                     }
                 };
 
-                // Send events to MIDI output
-                if !events.is_empty() {
+                // Send events to MIDI output (only if not muted)
+                if !events.is_empty() && !muted.load(Ordering::SeqCst) {
                     if let Ok(mut out_guard) = midi_out.lock() {
                         if let Some(ref mut out) = *out_guard {
                             for event in events {
@@ -920,4 +961,66 @@ fn start_midi_listener(
         Ok(conn) => (Some(conn), port_name),
         Err(_) => (None, "Failed to connect".to_string()),
     }
+}
+
+/// Start a CC listener on a specific device to receive mute commands.
+/// Looks for an input port matching the output device name.
+fn start_cc_listener(
+    device_name: &str,
+    channel: u8,
+    muted: Arc<AtomicBool>,
+    midi_out: Arc<Mutex<Option<MidiOut>>>,
+) -> Option<midir::MidiInputConnection<()>> {
+    let midi_in = MidiInput::new("looper-cc").ok()?;
+
+    let in_ports = midi_in.ports();
+
+    // Find input port matching the output device name
+    let port_idx = in_ports.iter().position(|p| {
+        midi_in.port_name(p)
+            .map(|n| n.contains(device_name))
+            .unwrap_or(false)
+    })?;
+
+    let port = &in_ports[port_idx];
+    let port_name = midi_in.port_name(port).unwrap_or_else(|_| "Unknown".into());
+    println!("CC listener connected to: {}", port_name);
+
+    let connection = midi_in.connect(
+        port,
+        "looper-cc-in",
+        move |_timestamp, message, _| {
+            // Check for mute toggle (CC 94 on the specified channel)
+            // CC message: 0xBn where n is channel (0-15)
+            if message.len() >= 3 {
+                let status = message[0];
+                let is_cc = (status & 0xF0) == 0xB0;
+                let msg_channel = status & 0x0F;
+                let cc_num = message[1];
+                let cc_val = message[2];
+
+                if is_cc && msg_channel == channel && cc_num == 94 {
+                    let should_mute = cc_val > 0;
+                    let was_muted = muted.load(Ordering::SeqCst);
+
+                    if should_mute && !was_muted {
+                        println!("Muting MIDI output (CC 94 on ch {})", channel + 1);
+                        // Send All Notes Off
+                        if let Ok(mut out_guard) = midi_out.lock() {
+                            if let Some(ref mut out) = *out_guard {
+                                let _ = out.send(&[0xB0 | channel, 123, 0]);
+                            }
+                        }
+                    } else if !should_mute && was_muted {
+                        println!("Unmuting MIDI output (CC 94 on ch {})", channel + 1);
+                    }
+
+                    muted.store(should_mute, Ordering::SeqCst);
+                }
+            }
+        },
+        (),
+    );
+
+    connection.ok()
 }

@@ -1,9 +1,9 @@
-zero_indexed_countdown: true
 output_device: Elektron Syntakt
 output_channel: 9
+zero_indexed_countdown: true
 slots:
   'A':
-    loop_file: '[Empty 8 bars]'
+    loop_file: '[Empty 4 bars]'
     repeat_count: 1
     next_slot: 'B'
   'B':

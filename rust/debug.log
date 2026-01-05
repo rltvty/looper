@@ -79,9 +79,56 @@ Found 20 loops in data/out/
 Loaded loop '[Empty 8 bars]' into slot A from config
 Loaded loop 'Rappers Delight - bass - Electric Bass finger - bars 13-16' into slot B from config
 Loaded loop 'Seven Nation Army With Bass Guitar - bass - Jack White Bass Immitation - bars 1-4' into slot C from config
+CC listener connected to: Elektron Syntakt
+Loaded loop '[Empty 4 bars]' into slot A
+Config saved to /Users/epinzur/src/github.com/rltvty/looper/rust/looper_config.yaml
+Play clicked: is_master=false, was_running=false
+Sending START
+Stop clicked: is_master=false
+Sending STOP
 Play clicked: is_master=true, was_running=false
 Sending START
 Clock generator: starting clocks
+Muting MIDI output (CC 94 on ch 9)
+Unmuting MIDI output (CC 94 on ch 9)
+Muting MIDI output (CC 94 on ch 9)
+Unmuting MIDI output (CC 94 on ch 9)
+Muting MIDI output (CC 94 on ch 9)
+Unmuting MIDI output (CC 94 on ch 9)
+Muting MIDI output (CC 94 on ch 9)
+Unmuting MIDI output (CC 94 on ch 9)
+Muting MIDI output (CC 94 on ch 9)
+Unmuting MIDI output (CC 94 on ch 9)
+Muting MIDI output (CC 94 on ch 9)
+Unmuting MIDI output (CC 94 on ch 9)
+Muting MIDI output (CC 94 on ch 9)
+Unmuting MIDI output (CC 94 on ch 9)
+Muting MIDI output (CC 94 on ch 9)
+Unmuting MIDI output (CC 94 on ch 9)
+Muting MIDI output (CC 94 on ch 9)
+Unmuting MIDI output (CC 94 on ch 9)
+Muting MIDI output (CC 94 on ch 9)
+Unmuting MIDI output (CC 94 on ch 9)
+Muting MIDI output (CC 94 on ch 9)
+Unmuting MIDI output (CC 94 on ch 9)
+Stop clicked: is_master=true
+Sending STOP
+Clock generator: stopped
+Play clicked: is_master=true, was_running=false
+Sending START
+Clock generator: starting clocks
+Muting MIDI output (CC 94 on ch 9)
+Unmuting MIDI output (CC 94 on ch 9)
+Muting MIDI output (CC 94 on ch 9)
+Unmuting MIDI output (CC 94 on ch 9)
+Muting MIDI output (CC 94 on ch 9)
+Unmuting MIDI output (CC 94 on ch 9)
+Muting MIDI output (CC 94 on ch 9)
+Unmuting MIDI output (CC 94 on ch 9)
+Muting MIDI output (CC 94 on ch 9)
+Unmuting MIDI output (CC 94 on ch 9)
+Muting MIDI output (CC 94 on ch 9)
+Unmuting MIDI output (CC 94 on ch 9)
 Stop clicked: is_master=true
 Sending STOP
 Clock generator: stopped
