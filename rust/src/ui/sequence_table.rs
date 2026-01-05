@@ -58,7 +58,7 @@ impl fmt::Display for LoopOption {
 
 impl LoopOption {
     /// Build options list from available loops
-    pub fn from_available(available: &[(String, std::path::PathBuf)]) -> Vec<LoopOption> {
+    pub fn from_available(available: &[(String, Option<std::path::PathBuf>)]) -> Vec<LoopOption> {
         let mut opts = vec![LoopOption {
             index: None,
             name: "--".to_string(),
@@ -260,7 +260,7 @@ fn view_slot_row<'a, M: 'a + Clone>(
 pub fn view_sequence_table<'a, M: 'a + Clone>(
     grid: &SequenceGrid,
     playback_state: Option<PlaybackState>,
-    available_loops: &[(String, std::path::PathBuf)],
+    available_loops: &[(String, Option<std::path::PathBuf>)],
     on_loop_change: impl Fn(SlotId, Option<usize>) -> M + 'a + Copy,
     on_next_change: impl Fn(SlotId, Option<SlotId>) -> M + 'a + Copy,
     on_quan_decrement: impl Fn(SlotId) -> M + 'a + Copy,

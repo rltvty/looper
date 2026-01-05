@@ -32,6 +32,15 @@ pub struct Loop {
 }
 
 impl Loop {
+    /// Create an empty (silent) loop of specified length in bars.
+    pub fn empty(name: &str, bars: u64) -> Self {
+        Self {
+            name: name.to_string(),
+            length_clocks: bars * 4 * CLOCKS_PER_BEAT,
+            events: Vec::new(),
+        }
+    }
+
     /// Load a MIDI file and convert it to a Loop.
     ///
     /// The `loop_length_bars` parameter specifies how many bars the loop should be.
@@ -287,6 +296,12 @@ pub struct PlaybackState {
     pub current_iteration: u32,
     /// Total repeat count for current slot
     pub total_iterations: u32,
+    /// Current bar within the loop (1-indexed)
+    pub current_bar: u32,
+    /// Total bars in the loop
+    pub total_bars: u32,
+    /// Current beat within the bar (1-indexed)
+    pub current_beat: u32,
 }
 
 /// An entry in a sequence: a loop with a repeat count.
@@ -322,6 +337,8 @@ pub struct SequencePlayer {
     next_event_idx: usize,
     /// Clock position when current loop iteration started
     loop_start_clock: u64,
+    /// Last clock count seen (for UI position calculation)
+    last_clock_count: u64,
     /// Whether playback is enabled
     pub playing: bool,
 }
@@ -336,6 +353,7 @@ impl SequencePlayer {
             current_iteration: 0,
             next_event_idx: 0,
             loop_start_clock: 0,
+            last_clock_count: 0,
             playing: false,
         }
     }
@@ -369,6 +387,10 @@ impl SequencePlayer {
         self.current_iteration = 0;
         self.next_event_idx = 0;
         self.loop_start_clock = 0;
+        // Also reset grid mode if active
+        if self.grid.is_some() {
+            self.reset_grid();
+        }
     }
 
     /// Get the name of the currently playing loop.
@@ -430,11 +452,31 @@ impl SequencePlayer {
         let grid = self.grid.as_ref()?;
         let slot_id = self.current_slot?;
         let slot = grid.get(slot_id);
+        let loop_data = slot.loop_data.as_ref()?;
+
+        let length_clocks = loop_data.length_clocks;
+        let total_bars = (length_clocks / (4 * CLOCKS_PER_BEAT)) as u32;
+
+        // Calculate position within current loop
+        let elapsed = self.last_clock_count.saturating_sub(self.loop_start_clock);
+        let position_in_loop = if length_clocks > 0 {
+            elapsed % length_clocks
+        } else {
+            0
+        };
+
+        // Convert position to bars and beats (1-indexed)
+        let total_beats = position_in_loop / CLOCKS_PER_BEAT;
+        let current_bar = (total_beats / 4) as u32 + 1;
+        let current_beat = (total_beats % 4) as u32 + 1;
 
         Some(PlaybackState {
             current_slot: slot_id,
             current_iteration: self.current_iteration + 1,
             total_iterations: slot.repeat_count,
+            current_bar,
+            total_bars,
+            current_beat,
         })
     }
 
@@ -508,6 +550,9 @@ impl SequencePlayer {
 
     /// Tick for grid-based playback.
     fn tick_grid(&mut self, clock_count: u64) -> Vec<Vec<u8>> {
+        // Store clock for UI position calculation
+        self.last_clock_count = clock_count;
+
         let grid = match &self.grid {
             Some(g) => g,
             None => return Vec::new(),
@@ -527,7 +572,8 @@ impl SequencePlayer {
         let repeat_count = slot.repeat_count;
         let length_clocks = loop_data.length_clocks;
 
-        if loop_data.events.is_empty() || length_clocks == 0 {
+        // Zero-length loops can't advance
+        if length_clocks == 0 {
             return Vec::new();
         }
 
@@ -541,6 +587,11 @@ impl SequencePlayer {
             self.advance_to_next_slot(clock_count);
             // Return events at position 0 of the new slot
             return self.collect_grid_events_at_position(0);
+        }
+
+        // Empty loops (no events) still need to track iterations but return no events
+        if loop_data.events.is_empty() {
+            return Vec::new();
         }
 
         // Check if we've wrapped to a new iteration within current loop
@@ -592,6 +643,7 @@ impl SequencePlayer {
                 break;
             }
         }
+
         events
     }
 

@@ -1,0 +1,87 @@
+warning: associated function `new` is never used
+  --> src/midi.rs:63:12
+   |
+61 | impl MidiOut {
+   | ------------ associated function in this implementation
+62 |     /// Create a new MIDI output, preferring IAC Driver on macOS.
+63 |     pub fn new() -> Result<Self, String> {
+   |            ^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated constant `ALL` is never used
+   --> src/playback.rs:153:15
+    |
+151 | impl SlotId {
+    | ----------- associated constant in this implementation
+152 |     /// All 26 slot IDs from A to Z.
+153 |     pub const ALL: [SlotId; 26] = [
+    |               ^^^
+
+warning: method `has_loop` is never used
+   --> src/playback.rs:227:12
+    |
+196 | impl SequenceSlot {
+    | ----------------- method in this implementation
+...
+227 |     pub fn has_loop(&self) -> bool {
+    |            ^^^^^^^^
+
+warning: method `get_mut` is never used
+   --> src/playback.rs:259:12
+    |
+241 | impl SequenceGrid {
+    | ----------------- method in this implementation
+...
+259 |     pub fn get_mut(&mut self, id: SlotId) -> &mut SequenceSlot {
+    |            ^^^^^^^
+
+warning: multiple methods are never used
+   --> src/playback.rs:362:12
+    |
+346 | impl SequencePlayer {
+    | ------------------- methods in this implementation
+...
+362 |     pub fn load(&mut self, sequence: Sequence) {
+    |            ^^^^
+...
+380 |     pub fn stop(&mut self) {
+    |            ^^^^
+...
+397 |     pub fn current_loop_name(&self) -> Option<&str> {
+    |            ^^^^^^^^^^^^^^^^^
+...
+404 |     pub fn current_state(&self) -> Option<(usize, u32, u32)> {
+    |            ^^^^^^^^^^^^^
+...
+484 |     pub fn next_slot_id(&self) -> Option<SlotId> {
+    |            ^^^^^^^^^^^^
+...
+491 |     pub fn current_slot_id(&self) -> Option<SlotId> {
+    |            ^^^^^^^^^^^^^^^
+...
+496 |     pub fn is_grid_mode(&self) -> bool {
+    |            ^^^^^^^^^^^^
+
+warning: `looper` (bin "looper") generated 5 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running `target/debug/looper`
+Loaded config from /Users/epinzur/src/github.com/rltvty/looper/rust/looper_config.yaml
+Found 6 MIDI output ports
+  0: MIDICAKE-ARP    
+  1: Elektron Syntakt
+  2: Elektron Digitone
+  3: IAC Driver Bus 1
+  4: IAC Driver Bus 2
+  5: FluidSynth virtual port (513)
+MIDI Output connected to: Elektron Syntakt
+Found 20 loops in data/out/
+Loaded loop '[Empty 8 bars]' into slot A from config
+Loaded loop 'Rappers Delight - bass - Electric Bass finger - bars 13-16' into slot B from config
+Loaded loop 'Seven Nation Army With Bass Guitar - bass - Jack White Bass Immitation - bars 1-4' into slot C from config
+Play clicked: is_master=true, was_running=false
+Sending START
+Clock generator: starting clocks
+Stop clicked: is_master=true
+Sending STOP
+Clock generator: stopped

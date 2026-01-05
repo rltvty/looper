@@ -36,3 +36,7 @@ image = "0.25"
 
 # Timestamps
 chrono = "0.4"
+
+# Serialization (for config persistence)
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"

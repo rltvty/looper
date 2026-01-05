@@ -4,6 +4,7 @@
 //! loads a MIDI loop, and plays it back in sync with the external clock.
 
 mod clock;
+mod config;
 mod midi;
 mod playback;
 mod ui;
@@ -21,6 +22,7 @@ use iced::{Center, Element, Fill, Subscription, Task, Theme};
 use midir::MidiInput;
 
 use clock::ClockState;
+use config::{LooperConfig, SlotConfig};
 use midi::MidiOut;
 use playback::{Loop, SequenceGrid, SequencePlayer, SlotId};
 use ui::view_sequence_table;
@@ -48,12 +50,16 @@ struct Looper {
     sequence_grid: SequenceGrid,
     // Screenshot request flag (set by MIDI CC 119)
     screenshot_requested: Arc<AtomicBool>,
-    // Available loops for dropdown
-    available_loops: Vec<(String, PathBuf)>,
+    // Available loops for dropdown (name, optional path - None for built-ins)
+    available_loops: Vec<(String, Option<PathBuf>)>,
     // MIDI output routing
     available_outputs: Vec<String>,
     selected_output: usize,
     output_channel: u8, // 0-15 (displayed as 1-16)
+    // Config persistence
+    config_path: PathBuf,
+    // Display settings
+    zero_indexed_countdown: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -72,15 +78,27 @@ enum Message {
     SetOutputChannel(u8),
 }
 
+/// Built-in empty loop names (no MIDI file needed).
+const EMPTY_LOOP_4: &str = "[Empty 4 bars]";
+const EMPTY_LOOP_8: &str = "[Empty 8 bars]";
+const EMPTY_LOOP_16: &str = "[Empty 16 bars]";
+
 /// Scan for available MIDI loops in the data/out directory.
-fn scan_available_loops() -> Vec<(String, PathBuf)> {
+/// Returns (name, Option<path>) - path is None for built-in loops.
+fn scan_available_loops() -> Vec<(String, Option<PathBuf>)> {
     let data_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap_or(std::path::Path::new("."))
         .join("data/out");
 
-    let mut loops = Vec::new();
+    // Start with built-in empty loops
+    let mut loops: Vec<(String, Option<PathBuf>)> = vec![
+        (EMPTY_LOOP_4.to_string(), None),
+        (EMPTY_LOOP_8.to_string(), None),
+        (EMPTY_LOOP_16.to_string(), None),
+    ];
 
+    // Add MIDI files from data/out
     if let Ok(entries) = std::fs::read_dir(&data_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -90,14 +108,20 @@ fn scan_available_loops() -> Vec<(String, PathBuf)> {
                     .and_then(|s| s.to_str())
                     .unwrap_or("Unknown")
                     .to_string();
-                loops.push((name, path));
+                loops.push((name, Some(path)));
             }
         }
     }
 
-    // Sort by name for consistent ordering
-    loops.sort_by(|a, b| a.0.cmp(&b.0));
-    loops
+    // Sort file loops by name (keep built-ins at top)
+    let (built_in, mut file_loops): (Vec<_>, Vec<_>) = loops
+        .into_iter()
+        .partition(|(_, path)| path.is_none());
+    file_loops.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut result = built_in;
+    result.extend(file_loops);
+    result
 }
 
 /// Wrapper for output device dropdown options.
@@ -130,6 +154,19 @@ impl Looper {
         let master_mode = Arc::new(AtomicBool::new(false));
         let screenshot_requested = Arc::new(AtomicBool::new(false));
 
+        // Load saved configuration
+        let config_path = LooperConfig::default_path();
+        let config = match LooperConfig::load(&config_path) {
+            Ok(c) => {
+                println!("Loaded config from {}", config_path.display());
+                c
+            }
+            Err(e) => {
+                eprintln!("Failed to load config: {}", e);
+                LooperConfig::default()
+            }
+        };
+
         // Scan for available MIDI output ports
         let available_outputs = midi::scan_output_ports();
         println!("Found {} MIDI output ports", available_outputs.len());
@@ -137,12 +174,24 @@ impl Looper {
             println!("  {}: {}", i, name);
         }
 
-        // Find IAC Driver index as default, or use 0
-        let selected_output = available_outputs
-            .iter()
-            .position(|n| n.contains("IAC"))
-            .unwrap_or(0);
-        let output_channel: u8 = 0; // Default to channel 1 (0-indexed)
+        // Find output device from config, or fall back to IAC Driver, or first port
+        let selected_output = if let Some(ref device_name) = config.output_device {
+            available_outputs
+                .iter()
+                .position(|n| n == device_name)
+                .unwrap_or_else(|| {
+                    println!("Configured device '{}' not found, using default", device_name);
+                    available_outputs.iter().position(|n| n.contains("IAC")).unwrap_or(0)
+                })
+        } else {
+            available_outputs.iter().position(|n| n.contains("IAC")).unwrap_or(0)
+        };
+
+        // Channel from config (config stores 1-indexed, we use 0-indexed internally)
+        let output_channel: u8 = config.output_channel.saturating_sub(1).min(15);
+
+        // Display settings from config
+        let zero_indexed_countdown = config.zero_indexed_countdown;
 
         // Connect to the selected output
         let midi_out = Arc::new(Mutex::new(
@@ -153,10 +202,54 @@ impl Looper {
         let available_loops = scan_available_loops();
         println!("Found {} loops in data/out/", available_loops.len());
 
-        // Initialize empty grid - user will load loops via UI
-        let sequence_grid = SequenceGrid::new();
+        // Initialize grid and load loops from config
+        let mut sequence_grid = SequenceGrid::new();
 
-        // Load grid into player (starts empty, user adds loops)
+        // Apply slot configurations from saved config
+        for c in 'A'..='Z' {
+            let slot_config = config.get_slot(c);
+            let slot_id = SlotId(c);
+
+            // Load loop if configured
+            if let Some(ref loop_name) = slot_config.loop_file {
+                // Try to find the loop in available_loops by name
+                if let Some((_, path_opt)) = available_loops.iter().find(|(name, _)| name == loop_name) {
+                    let loaded_loop = match path_opt {
+                        Some(path) => {
+                            // File-based loop
+                            Loop::from_file(path, 4).ok()
+                        }
+                        None => {
+                            // Built-in empty loop
+                            Some(match loop_name.as_str() {
+                                EMPTY_LOOP_4 => Loop::empty(loop_name, 4),
+                                EMPTY_LOOP_8 => Loop::empty(loop_name, 8),
+                                EMPTY_LOOP_16 => Loop::empty(loop_name, 16),
+                                _ => Loop::empty(loop_name, 4),
+                            })
+                        }
+                    };
+
+                    if let Some(mut lp) = loaded_loop {
+                        lp.set_channel(output_channel);
+                        println!("Loaded loop '{}' into slot {} from config", loop_name, c);
+                        sequence_grid.load_loop(slot_id, lp);
+                    }
+                } else {
+                    eprintln!("Configured loop '{}' not found", loop_name);
+                }
+            }
+
+            // Set repeat count
+            sequence_grid.set_repeat_count(slot_id, slot_config.repeat_count);
+
+            // Set next slot
+            if let Some(next_char) = slot_config.next_slot {
+                sequence_grid.set_next(slot_id, Some(SlotId(next_char)));
+            }
+        }
+
+        // Load grid into player
         {
             let mut player = sequence_player.lock().unwrap();
             player.load_grid(sequence_grid.clone());
@@ -284,6 +377,41 @@ impl Looper {
             available_outputs,
             selected_output,
             output_channel,
+            config_path,
+            zero_indexed_countdown,
+        }
+    }
+
+    /// Save the current configuration to disk.
+    fn save_config(&self) {
+        let mut config = LooperConfig::default();
+
+        // Save output device
+        if let Some(name) = self.available_outputs.get(self.selected_output) {
+            config.output_device = Some(name.clone());
+        }
+
+        // Save channel (1-indexed for YAML readability)
+        config.output_channel = self.output_channel + 1;
+
+        // Save display settings
+        config.zero_indexed_countdown = self.zero_indexed_countdown;
+
+        // Save slot configurations
+        for slot in &self.sequence_grid.slots {
+            let slot_config = SlotConfig {
+                loop_file: slot.loop_data.as_ref().map(|l| l.name.clone()),
+                repeat_count: slot.repeat_count,
+                next_slot: slot.next_slot.map(|s| s.0),
+            };
+            config.set_slot(slot.id.0, slot_config);
+        }
+
+        // Write to file
+        if let Err(e) = config.save(&self.config_path) {
+            eprintln!("Failed to save config: {}", e);
+        } else {
+            println!("Config saved to {}", self.config_path.display());
         }
     }
 
@@ -378,12 +506,14 @@ impl Looper {
                 self.sequence_grid.set_next(slot_id, next_slot);
                 // Sync grid to player
                 self.sequence_player.lock().unwrap().update_grid(self.sequence_grid.clone());
+                self.save_config();
             }
             Message::DecrementQuan(slot_id) => {
                 let current = self.sequence_grid.get(slot_id).repeat_count;
                 if current > 1 {
                     self.sequence_grid.set_repeat_count(slot_id, current - 1);
                     self.sequence_player.lock().unwrap().update_grid(self.sequence_grid.clone());
+                    self.save_config();
                 }
             }
             Message::IncrementQuan(slot_id) => {
@@ -391,23 +521,36 @@ impl Looper {
                 if current < 999 {
                     self.sequence_grid.set_repeat_count(slot_id, current + 1);
                     self.sequence_player.lock().unwrap().update_grid(self.sequence_grid.clone());
+                    self.save_config();
                 }
             }
             Message::SetSlotLoop(slot_id, loop_index) => {
                 // Load or clear the loop for this slot
                 match loop_index {
                     Some(idx) => {
-                        if let Some((name, path)) = self.available_loops.get(idx) {
-                            // Default to 4 bars - could be made configurable later
-                            match Loop::from_file(path, 4) {
-                                Ok(mut loaded_loop) => {
-                                    loaded_loop.set_channel(self.output_channel);
-                                    println!("Loaded loop '{}' into slot {}", name, slot_id);
-                                    self.sequence_grid.load_loop(slot_id, loaded_loop);
+                        if let Some((name, path_opt)) = self.available_loops.get(idx) {
+                            let loaded_loop = match path_opt {
+                                Some(path) => {
+                                    // File-based loop
+                                    Loop::from_file(path, 4).ok()
                                 }
-                                Err(e) => {
-                                    eprintln!("Failed to load loop '{}': {}", name, e);
+                                None => {
+                                    // Built-in empty loop
+                                    Some(match name.as_str() {
+                                        EMPTY_LOOP_4 => Loop::empty(name, 4),
+                                        EMPTY_LOOP_8 => Loop::empty(name, 8),
+                                        EMPTY_LOOP_16 => Loop::empty(name, 16),
+                                        _ => Loop::empty(name, 4),
+                                    })
                                 }
+                            };
+
+                            if let Some(mut lp) = loaded_loop {
+                                lp.set_channel(self.output_channel);
+                                println!("Loaded loop '{}' into slot {}", name, slot_id);
+                                self.sequence_grid.load_loop(slot_id, lp);
+                            } else {
+                                eprintln!("Failed to load loop '{}'", name);
                             }
                         }
                     }
@@ -417,6 +560,7 @@ impl Looper {
                 }
                 // Sync grid to player
                 self.sequence_player.lock().unwrap().update_grid(self.sequence_grid.clone());
+                self.save_config();
             }
             Message::SetOutputDevice(idx) => {
                 if idx < self.available_outputs.len() {
@@ -444,6 +588,7 @@ impl Looper {
                             *self.midi_out.lock().unwrap() = None;
                         }
                     }
+                    self.save_config();
                 }
             }
             Message::SetOutputChannel(channel) => {
@@ -468,6 +613,7 @@ impl Looper {
                 }
                 // Sync grid to player
                 self.sequence_player.lock().unwrap().update_grid(self.sequence_grid.clone());
+                self.save_config();
             }
         }
         Task::none()
@@ -559,10 +705,33 @@ impl Looper {
         .spacing(10)
         .align_y(iced::Center);
 
-        // Get playback state for grid highlighting
+        // Get playback state for grid highlighting and countdown display
         let playback_state = {
             let player = self.sequence_player.lock().unwrap();
             player.grid_playback_state()
+        };
+
+        // Build countdown display text (bars.beats remaining until transition)
+        let countdown_text = if running {
+            if let Some(ref state) = playback_state {
+                let slot_name = self.sequence_grid.get(state.current_slot).loop_name();
+                // Truncate long names
+                let display_name = if slot_name.len() > 25 {
+                    format!("{}...", &slot_name[..22])
+                } else {
+                    slot_name.to_string()
+                };
+                // Calculate remaining bars (including current) with repeats multiplied out
+                let offset = if self.zero_indexed_countdown { 0 } else { 1 };
+                let bars_remaining = (state.total_iterations - state.current_iteration) * state.total_bars
+                    + (state.total_bars - state.current_bar + offset);
+                let beats_remaining = 4 + offset - state.current_beat;
+                format!("{}: {}.{}", display_name, bars_remaining, beats_remaining)
+            } else {
+                "No loop playing".to_string()
+            }
+        } else {
+            "Stopped".to_string()
         };
 
         // Sequence table
@@ -587,6 +756,8 @@ impl Looper {
             ].spacing(20),
             text("").size(5),
             transport_controls,
+            text("").size(5),
+            text(countdown_text).size(16),
             text("").size(5),
             output_row,
             text("").size(10),
